@@ -103,57 +103,33 @@ downsample_track <- function(track_dt, target_hz) {
 }
 
 prompt_target_frequency <- function(default_hz = 1) {
-  freq_values <- c("1 Hz" = 1, "5 Hz" = 5, "10 Hz" = 10)
-  default_label <- names(freq_values)[match(default_hz, freq_values)]
+  allowed_hz <- c(1, 5, 10)
 
   if (!interactive()) {
     message("ℹ️ Skript läuft nicht interaktiv – es wird standardmäßig ", default_hz, " Hz verwendet.")
     return(default_hz)
   }
 
-  if (rstudioapi::isAvailable() && rstudioapi::hasFun("selectList")) {
-    selection <- rstudioapi::selectList(
-      choices = names(freq_values),
-      title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
-      selected = default_label,
-      multiple = FALSE
-    )
-
-    if (length(selection) == 0) {
-      message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
-      return(default_hz)
-    }
-
-    chosen <- freq_values[[selection]]
-    message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen, " Hz.")
-    return(chosen)
-  }
-
-  old_menu_opt <- getOption("menu.graphics")
-  on.exit(options(menu.graphics = old_menu_opt), add = TRUE)
-  options(menu.graphics = FALSE)
+  prompt_text <- paste0(
+    "Wähle die maximale Ziel-Abtastrate (nur 1, 5 oder 10 Hz). ",
+    "Drücke Enter für den Standardwert ", default_hz, " Hz: "
+  )
 
   repeat {
-    selection <- utils::menu(
-      choices = names(freq_values),
-      title = paste0(
-        "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung\n",
-        "(0 oder ESC für Abbruch – dann wird der Standardwert ", default_hz, " Hz genutzt)"
-      )
-    )
+    user_input <- readline(prompt_text)
 
-    if (selection <= 0) {
-      message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
+    if (!nzchar(user_input)) {
+      message("ℹ️ Keine Eingabe – es wird standardmäßig ", default_hz, " Hz verwendet.")
       return(default_hz)
     }
 
-    chosen_hz <- unname(freq_values[selection])
-    if (is.finite(chosen_hz) && chosen_hz > 0) {
-      message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen_hz, " Hz.")
-      return(chosen_hz)
+    numeric_value <- suppressWarnings(as.numeric(user_input))
+    if (!is.na(numeric_value) && numeric_value %in% allowed_hz) {
+      message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", numeric_value, " Hz.")
+      return(numeric_value)
     }
 
-    message("⚠️ Ungültige Auswahl. Bitte erneut versuchen.")
+    message("⚠️ Ungültige Eingabe. Erlaubt sind ausschließlich 1, 5 oder 10 Hz.")
   }
 }
 
