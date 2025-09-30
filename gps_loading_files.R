@@ -182,6 +182,11 @@ parse_tracks_parallel <- function(gps_data, tz_local, empty_template) {
   if (.Platform$OS.type == "windows") {
     cl <- parallel::makeCluster(cores)
     on.exit(parallel::stopCluster(cl), add = TRUE)
+    parallel::clusterExport(
+      cl,
+      varlist = c("convert_nmea_coord", "parse_rmc_lines"),
+      envir = environment()
+    )
     parallel::clusterEvalQ(cl, { library(data.table); NULL })
     result <- parallel::parLapply(
       cl,
