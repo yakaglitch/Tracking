@@ -78,9 +78,9 @@ parse_rmc_lines <- function(nmea_lines, tz) {
   coords <- rbindlist(entries, fill = TRUE)
   if (nrow(coords) == 0) return(NULL)
   setorder(coords, timestamp, source_index)
-  coords[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+  coords[, timestamp_unix_ms := round(as.numeric(timestamp) * 1000)]
   coords[, timestamp_ms := format(timestamp, "%Y-%m-%d %H:%M:%OS3", tz = tz)]
-  setcolorder(coords, c("timestamp", "timestamp_ms", "lat", "lon", "speed_knots", "speed_kmh", "source_index", "time_offset_s"))
+  setcolorder(coords, c("timestamp", "timestamp_ms", "timestamp_unix_ms", "lat", "lon", "speed_knots", "speed_kmh", "source_index"))
   coords
 }
 
@@ -95,7 +95,7 @@ downsample_track <- function(track_dt, target_hz) {
   diffs <- diffs[diffs > 0]
   if (length(diffs) == 0) {
     result <- copy(track_dt[1])
-    result[, time_offset_s := 0]
+    result[, timestamp_unix_ms := round(as.numeric(timestamp) * 1000)]
     if (!"timestamp_ms" %in% names(result)) {
       tz <- attr(track_dt$timestamp, "tzone")
       if (is.null(tz)) tz <- ""
@@ -107,7 +107,9 @@ downsample_track <- function(track_dt, target_hz) {
   actual_hz <- 1 / median(diffs)
   if (!is.finite(actual_hz) || actual_hz <= target_hz + 1e-9) {
     result <- copy(track_dt)
-    result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+    if (!"timestamp_unix_ms" %in% names(result)) {
+      result[, timestamp_unix_ms := round(as.numeric(timestamp) * 1000)]
+    }
     if (!"timestamp_ms" %in% names(result)) {
       tz <- attr(track_dt$timestamp, "tzone")
       if (is.null(tz)) tz <- ""
@@ -122,13 +124,17 @@ downsample_track <- function(track_dt, target_hz) {
   
   if (all(keep)) {
     result <- copy(track_dt)
-    result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+    if (!"timestamp_unix_ms" %in% names(result)) {
+      result[, timestamp_unix_ms := round(as.numeric(timestamp) * 1000)]
+    }
     return(result)
   }
   
   reduced <- track_dt[keep]
   result <- copy(reduced)
-  result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+  if (!"timestamp_unix_ms" %in% names(result)) {
+    result[, timestamp_unix_ms := round(as.numeric(timestamp) * 1000)]
+  }
   if (!"timestamp_ms" %in% names(result)) {
     tz <- attr(track_dt$timestamp, "tzone")
     if (is.null(tz)) tz <- ""
@@ -284,12 +290,12 @@ empty_template <- data.table(
   track_id = integer(),
   timestamp = as.POSIXct(character(), tz = tz_local),
   timestamp_ms = character(),
+  timestamp_unix_ms = numeric(),
   lat = numeric(),
   lon = numeric(),
   speed_knots = numeric(),
   speed_kmh = numeric(),
-  source_index = integer(),
-  time_offset_s = numeric()
+  source_index = integer()
 )
 
 column_order <- names(empty_template)
