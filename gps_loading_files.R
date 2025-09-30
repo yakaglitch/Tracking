@@ -5,6 +5,98 @@
 library(fs)
 library(data.table)
 
+convert_nmea_coord <- function(value, hemisphere) {
+  if (!nzchar(value)) return(NA_real_)
+  value_num <- suppressWarnings(as.numeric(value))
+  if (is.na(value_num)) return(NA_real_)
+
+  if (nchar(value) <= 4L) return(NA_real_)
+
+  if (hemisphere %in% c("N", "S")) {
+    deg <- as.integer(substr(value, 1, 2))
+    mins <- as.numeric(substr(value, 3, nchar(value)))
+  } else {
+    deg <- as.integer(substr(value, 1, 3))
+    mins <- as.numeric(substr(value, 4, nchar(value)))
+  }
+
+  if (is.na(deg) || is.na(mins)) return(NA_real_)
+
+  coord <- deg + mins / 60
+  if (hemisphere %in% c("S", "W")) coord <- -coord
+  coord
+}
+
+parse_rmc_lines <- function(nmea_lines, tz) {
+  gprmc <- grep("^\\$G[NP]RMC", nmea_lines, value = TRUE)
+  if (length(gprmc) == 0) return(NULL)
+
+  entries <- lapply(seq_along(gprmc), function(idx) {
+    parts <- strsplit(gprmc[idx], ",", fixed = TRUE)[[1]]
+    if (length(parts) < 10) return(NULL)
+    if (parts[3] != "A") return(NULL)
+
+    time_str <- parts[2]
+    date_str <- parts[10]
+
+    if (!nzchar(time_str) || !nzchar(date_str)) return(NULL)
+
+    if (nchar(time_str) < 6) return(NULL)
+    hour <- suppressWarnings(as.integer(substr(time_str, 1, 2)))
+    minute <- suppressWarnings(as.integer(substr(time_str, 3, 4)))
+    sec <- suppressWarnings(as.numeric(substr(time_str, 5, nchar(time_str))))
+
+    day <- suppressWarnings(as.integer(substr(date_str, 1, 2)))
+    month <- suppressWarnings(as.integer(substr(date_str, 3, 4)))
+    year <- suppressWarnings(as.integer(substr(date_str, 5, 6)))
+
+    if (any(is.na(c(hour, minute, sec, day, month, year)))) return(NULL)
+
+    year <- year + ifelse(year < 80, 2000L, 1900L)
+    base_time <- as.POSIXct(sprintf("%04d-%02d-%02d %02d:%02d:%02d", year, month, day, hour, minute, floor(sec)), tz = tz)
+    if (is.na(base_time)) return(NULL)
+    timestamp <- base_time + (sec - floor(sec))
+
+    lat <- convert_nmea_coord(parts[4], parts[5])
+    lon <- convert_nmea_coord(parts[6], parts[7])
+
+    if (is.na(lat) || is.na(lon)) return(NULL)
+
+    speed_knots <- suppressWarnings(as.numeric(parts[8]))
+    speed_kmh <- if (!is.na(speed_knots)) speed_knots * 1.852 else NA_real_
+
+    data.table(
+      timestamp = timestamp,
+      lat = lat,
+      lon = lon,
+      speed_knots = speed_knots,
+      speed_kmh = speed_kmh,
+      source_index = idx
+    )
+  })
+
+  coords <- rbindlist(entries, fill = TRUE)
+  if (nrow(coords) == 0) return(NULL)
+  setorder(coords, timestamp, source_index)
+  coords[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+  coords
+}
+
+downsample_track <- function(track_dt, target_hz) {
+  if (is.null(track_dt) || nrow(track_dt) == 0) return(track_dt)
+  if (!is.finite(target_hz) || target_hz <= 0) return(track_dt)
+
+  secs <- as.numeric(track_dt$timestamp)
+  if (anyNA(secs)) return(track_dt)
+
+  origin <- secs[1]
+  bins <- floor((secs - origin) * target_hz + 1e-9)
+  keep <- !duplicated(bins)
+  reduced <- track_dt[keep]
+  reduced[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+  reduced
+}
+
 # Sicherstellen, dass rstudioapi verfügbar ist
 if (!requireNamespace("rstudioapi", quietly = TRUE) || !rstudioapi::isAvailable()) {
   stop("Dieses Skript muss in RStudio mit aktivem rstudioapi laufen.")
@@ -94,3 +186,54 @@ assign("gps_index", gps_index, envir = .GlobalEnv)
 assign("gps_data", gps_data, envir = .GlobalEnv)
 
 message("✅ Fertig. ", length(gps_data), " Dateien geladen aus ", length(ym_dirs), " Monatsordner(n).")
+
+# ---- 6. Frequenz für Weiterverarbeitung wählen ----
+freq_choices <- c("1 Hz" = "1", "5 Hz" = "5", "10 Hz" = "10")
+freq_selection <- utils::select.list(
+  choices = names(freq_choices),
+  title = "Wähle die Ziel-Abtastrate für die Weiterverarbeitung",
+  multiple = FALSE
+)
+
+if (length(freq_selection) == 0) {
+  target_hz <- 1
+  message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig 1 Hz verwendet.")
+} else {
+  target_hz <- as.numeric(freq_choices[[freq_selection]])
+  message("ℹ️ Gewählte Ziel-Abtastrate: ", target_hz, " Hz.")
+}
+
+# ---- 7. Daten reduzieren und zusammenführen ----
+empty_template <- data.table(
+  track_id = integer(),
+  timestamp = as.POSIXct(character(), tz = tz_local),
+  lat = numeric(),
+  lon = numeric(),
+  speed_knots = numeric(),
+  speed_kmh = numeric(),
+  source_index = integer(),
+  time_offset_s = numeric()
+)
+
+resampled_list <- lapply(seq_along(gps_data), function(idx) {
+  key <- names(gps_data)[idx]
+  lines <- gps_data[[idx]]
+  parsed <- parse_rmc_lines(lines, tz_local)
+  if (is.null(parsed) || nrow(parsed) == 0) return(empty_template)
+
+  reduced <- downsample_track(parsed, target_hz)
+  if (nrow(reduced) == 0) return(empty_template)
+
+  reduced[, track_id := as.integer(gsub("^track_", "", key))]
+  reduced
+})
+
+gps_points_resampled <- rbindlist(resampled_list, fill = TRUE)
+
+assign("gps_points_resampled", gps_points_resampled, envir = .GlobalEnv)
+assign("gps_resample_hz", target_hz, envir = .GlobalEnv)
+
+message(
+  "✅ Reduzierter Datensatz mit ", target_hz, " Hz erstellt (",
+  nrow(gps_points_resampled), " Punkte) und in 'gps_points_resampled' abgelegt."
+)
