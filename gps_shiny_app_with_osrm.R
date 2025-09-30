@@ -121,13 +121,15 @@ server <- function(input, output, session) {
       poi_lookup <- poi_table[, .(id, name)]
       poi_table[, poi_color := "blue"]
 
-      if ("kategorie" %in% names(poi_table)) {
-        kategorie_clean <- tolower(poi_table$kategorie)
+      kategorie_col <- names(poi_table)[tolower(names(poi_table)) == "kategorie"]
+      if (length(kategorie_col) > 0) {
+        kategorie_clean <- tolower(trimws(poi_table[[kategorie_col[1]]]))
         poi_table[!is.na(kategorie_clean) & kategorie_clean == "dienstlich", poi_color := "red"]
       }
 
-      if ("typ" %in% names(poi_table)) {
-        typ_clean <- tolower(poi_table$typ)
+      typ_col <- names(poi_table)[tolower(names(poi_table)) == "typ"]
+      if (length(typ_col) > 0) {
+        typ_clean <- tolower(trimws(poi_table[[typ_col[1]]]))
         poi_table[!is.na(typ_clean) & typ_clean == "zuhause" & poi_color != "red", poi_color := "green"]
       }
     } else {
