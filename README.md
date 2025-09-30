@@ -123,3 +123,37 @@ install.packages(c(
   "httr",
   "jsonlite"
 ))
+
+```
+
+---
+
+## Ausführungsreihenfolge & Abhängigkeiten
+
+Damit die Shiny-App inklusive OSRM-Routen ohne Fehlermeldungen startet, müssen die Skripte nacheinander ausgeführt werden. Die Module bauen aufeinander auf und legen ihre Ergebnisse als Objekte im globalen R-Environment ab. Die folgende Reihenfolge stellt sicher, dass alle benötigten Daten verfügbar sind:
+
+1. **RStudio starten & Arbeitsumgebung vorbereiten**
+   - Öffne das Projekt in RStudio (benötigt wegen `rstudioapi`).
+   - Stelle sicher, dass die benötigten Pakete installiert sind (siehe oben).
+
+2. **GPS-Rohdaten laden – `gps_loading_files.R`**
+   - Skript ausführen (`source("gps_loading_files.R")`).
+   - Wähle das Basisverzeichnis mit den Monatsordnern (Format `YYYY-MM`).
+   - Ergebnis: `gps_index` (Metadaten je Fahrt) und `gps_data` (NMEA-Zeilen je Datei) werden im `.GlobalEnv` angelegt – diese Objekte werden von allen weiteren Schritten benötigt.
+
+3. **Streckenlängen & Fahrtdauern berechnen – `travel_distance_add.R`**
+   - Erst ausführen, nachdem `gps_index` und `gps_data` vorhanden sind.
+   - Fügt `gps_index` unter anderem `travel_distance_m`, Start-/Endkoordinaten sowie `real_duration_hm` hinzu; außerdem werden eventuelle OSRM-Zeitspalten aus Schritt 4 berücksichtigt.
+
+4. **OSRM-Routing ergänzen – `osrm_distance.R`**
+   - Vor dem Start Shiny sicherstellen, dass ein OSRM-Server (z. B. `http://localhost:5000`) läuft.
+   - Skript ausführen, um zu jeder Fahrt Distanz, Dauer und Koordinaten der optimalen Route zu ermitteln (`osrm_distance_m`, `osrm_duration_s`, `osrm_route_coords`).
+
+5. **POI-Tabelle bereitstellen**
+   - Die Shiny-App erwartet ein Objekt `poi_table` mit mindestens den Spalten `id` und `name` für Start-/Zielbezeichnungen. Lade oder erstelle diese Tabelle vor dem Start (z. B. aus einer CSV einlesen und als `data.table` speichern).
+
+6. **Shiny-App starten – `gps_shiny_app_with_osrm.R`**
+   - Nach erfolgreichem Abschluss der Schritte 2–5 `source("gps_shiny_app_with_osrm.R")` ausführen.
+   - Die App liest `gps_index`, `gps_data` und `poi_table` aus dem `.GlobalEnv` und ermöglicht das Ein- und Ausblenden von GPS-Tracks sowie OSRM-Routen inklusive farblicher Geschwindigkeitsdarstellung.
+
+**Tipp:** Sollte eines der Objekte fehlen, brechen die Skripte bewusst mit einer Fehlermeldung ab. Das hilft, eine inkonsistente Reihenfolge schnell zu erkennen.
