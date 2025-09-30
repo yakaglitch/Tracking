@@ -106,6 +106,23 @@ if (!requireNamespace("rstudioapi", quietly = TRUE) || !rstudioapi::isAvailable(
 root <- rstudioapi::selectDirectory("Wähle Verzeichnis mit YYYY-MM Unterordnern oder direkt einen YYYY-MM-Ordner")
 if (is.null(root)) stop("Abbruch: Kein Ordner gewählt.")
 
+# ---- 1a. Maximale Ziel-Frequenz wählen ----
+freq_choices <- c("1 Hz" = "1", "5 Hz" = "5", "10 Hz" = "10")
+freq_selection <- utils::select.list(
+  choices = names(freq_choices),
+  title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
+  multiple = FALSE,
+  preselect = "1 Hz"
+)
+
+if (length(freq_selection) == 0) {
+  target_hz <- 1
+  message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig 1 Hz verwendet.")
+} else {
+  target_hz <- as.numeric(freq_choices[[freq_selection]])
+  message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", target_hz, " Hz.")
+}
+
 # ---- 2. Regex für Ordner und Dateien ----
 tz_local <- Sys.timezone()
 re_dir <- "^[0-9]{4}-[0-9]{2}$"
@@ -187,23 +204,7 @@ assign("gps_data", gps_data, envir = .GlobalEnv)
 
 message("✅ Fertig. ", length(gps_data), " Dateien geladen aus ", length(ym_dirs), " Monatsordner(n).")
 
-# ---- 6. Frequenz für Weiterverarbeitung wählen ----
-freq_choices <- c("1 Hz" = "1", "5 Hz" = "5", "10 Hz" = "10")
-freq_selection <- utils::select.list(
-  choices = names(freq_choices),
-  title = "Wähle die Ziel-Abtastrate für die Weiterverarbeitung",
-  multiple = FALSE
-)
-
-if (length(freq_selection) == 0) {
-  target_hz <- 1
-  message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig 1 Hz verwendet.")
-} else {
-  target_hz <- as.numeric(freq_choices[[freq_selection]])
-  message("ℹ️ Gewählte Ziel-Abtastrate: ", target_hz, " Hz.")
-}
-
-# ---- 7. Daten reduzieren und zusammenführen ----
+# ---- 6. Daten reduzieren und zusammenführen ----
 empty_template <- data.table(
   track_id = integer(),
   timestamp = as.POSIXct(character(), tz = tz_local),
