@@ -5,6 +5,179 @@
 library(fs)
 library(data.table)
 
+convert_nmea_coord <- function(value, hemisphere) {
+  if (!nzchar(value)) return(NA_real_)
+  value_num <- suppressWarnings(as.numeric(value))
+  if (is.na(value_num)) return(NA_real_)
+
+  if (nchar(value) <= 4L) return(NA_real_)
+
+  if (hemisphere %in% c("N", "S")) {
+    deg <- as.integer(substr(value, 1, 2))
+    mins <- as.numeric(substr(value, 3, nchar(value)))
+  } else {
+    deg <- as.integer(substr(value, 1, 3))
+    mins <- as.numeric(substr(value, 4, nchar(value)))
+  }
+
+  if (is.na(deg) || is.na(mins)) return(NA_real_)
+
+  coord <- deg + mins / 60
+  if (hemisphere %in% c("S", "W")) coord <- -coord
+  coord
+}
+
+parse_rmc_lines <- function(nmea_lines, tz) {
+  gprmc <- grep("^\\$G[NP]RMC", nmea_lines, value = TRUE)
+  if (length(gprmc) == 0) return(NULL)
+
+  entries <- lapply(seq_along(gprmc), function(idx) {
+    parts <- strsplit(gprmc[idx], ",", fixed = TRUE)[[1]]
+    if (length(parts) < 10) return(NULL)
+    if (parts[3] != "A") return(NULL)
+
+    time_str <- parts[2]
+    date_str <- parts[10]
+
+    if (!nzchar(time_str) || !nzchar(date_str)) return(NULL)
+
+    if (nchar(time_str) < 6) return(NULL)
+    hour <- suppressWarnings(as.integer(substr(time_str, 1, 2)))
+    minute <- suppressWarnings(as.integer(substr(time_str, 3, 4)))
+    sec <- suppressWarnings(as.numeric(substr(time_str, 5, nchar(time_str))))
+
+    day <- suppressWarnings(as.integer(substr(date_str, 1, 2)))
+    month <- suppressWarnings(as.integer(substr(date_str, 3, 4)))
+    year <- suppressWarnings(as.integer(substr(date_str, 5, 6)))
+
+    if (any(is.na(c(hour, minute, sec, day, month, year)))) return(NULL)
+
+    year <- year + ifelse(year < 80, 2000L, 1900L)
+    base_time <- as.POSIXct(sprintf("%04d-%02d-%02d %02d:%02d:%02d", year, month, day, hour, minute, floor(sec)), tz = tz)
+    if (is.na(base_time)) return(NULL)
+    timestamp <- base_time + (sec - floor(sec))
+
+    lat <- convert_nmea_coord(parts[4], parts[5])
+    lon <- convert_nmea_coord(parts[6], parts[7])
+
+    if (is.na(lat) || is.na(lon)) return(NULL)
+
+    speed_knots <- suppressWarnings(as.numeric(parts[8]))
+    speed_kmh <- if (!is.na(speed_knots)) speed_knots * 1.852 else NA_real_
+
+    data.table(
+      timestamp = timestamp,
+      lat = lat,
+      lon = lon,
+      speed_knots = speed_knots,
+      speed_kmh = speed_kmh,
+      source_index = idx
+    )
+  })
+
+  coords <- rbindlist(entries, fill = TRUE)
+  if (nrow(coords) == 0) return(NULL)
+  setorder(coords, timestamp, source_index)
+  coords[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+  coords[, timestamp_ms := format(timestamp, "%Y-%m-%d %H:%M:%OS3", tz = tz)]
+  setcolorder(coords, c("timestamp", "timestamp_ms", "lat", "lon", "speed_knots", "speed_kmh", "source_index", "time_offset_s"))
+  coords
+}
+
+downsample_track <- function(track_dt, target_hz) {
+  if (is.null(track_dt) || nrow(track_dt) == 0) return(copy(track_dt))
+  if (!is.finite(target_hz) || target_hz <= 0) return(copy(track_dt))
+
+  secs <- as.numeric(track_dt$timestamp)
+  if (anyNA(secs)) return(copy(track_dt))
+
+  diffs <- diff(secs)
+  diffs <- diffs[diffs > 0]
+  if (length(diffs) == 0) {
+    result <- copy(track_dt[1])
+    result[, time_offset_s := 0]
+    if (!"timestamp_ms" %in% names(result)) {
+      tz <- attr(track_dt$timestamp, "tzone")
+      if (is.null(tz)) tz <- ""
+      result[, timestamp_ms := format(timestamp, "%Y-%m-%d %H:%M:%OS3", tz = tz)]
+    }
+    return(result)
+  }
+
+  actual_hz <- 1 / median(diffs)
+  if (!is.finite(actual_hz) || actual_hz <= target_hz + 1e-9) {
+    result <- copy(track_dt)
+    result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+    return(result)
+  }
+
+  origin <- secs[1]
+  bins <- floor((secs - origin) * target_hz + 1e-9)
+  keep <- !duplicated(bins)
+
+  if (all(keep)) {
+    result <- copy(track_dt)
+    result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+    return(result)
+  }
+
+  reduced <- track_dt[keep]
+  result <- copy(reduced)
+  result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+  if (!"timestamp_ms" %in% names(result)) {
+    tz <- attr(track_dt$timestamp, "tzone")
+    if (is.null(tz)) tz <- ""
+    result[, timestamp_ms := format(timestamp, "%Y-%m-%d %H:%M:%OS3", tz = tz)]
+  }
+  result
+}
+
+prompt_target_frequency <- function(default_hz = 1) {
+  freq_values <- c("1 Hz" = 1, "5 Hz" = 5, "10 Hz" = 10)
+
+  if (!interactive()) {
+    message("ℹ️ Skript läuft nicht interaktiv – es wird standardmäßig ", default_hz, " Hz verwendet.")
+    return(default_hz)
+  }
+
+  default_label <- names(freq_values)[match(default_hz, freq_values)]
+
+  if (!is.na(default_label) && rstudioapi::hasFun("selectList")) {
+    selection <- rstudioapi::selectList(
+      choices = names(freq_values),
+      title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
+      selected = default_label,
+      multiple = FALSE
+    )
+
+    if (length(selection) == 0) {
+      message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
+      return(default_hz)
+    }
+
+    chosen <- freq_values[[selection]]
+    message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen, " Hz.")
+    return(chosen)
+  }
+
+  # Fallback auf eine Konsolen-Auswahl, falls kein selectList verfügbar ist
+  selection <- utils::select.list(
+    choices = names(freq_values),
+    title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
+    preselect = default_label,
+    multiple = FALSE
+  )
+
+  if (length(selection) == 0) {
+    message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
+    return(default_hz)
+  }
+
+  chosen <- freq_values[[selection]]
+  message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen, " Hz.")
+  chosen
+}
+
 # Sicherstellen, dass rstudioapi verfügbar ist
 if (!requireNamespace("rstudioapi", quietly = TRUE) || !rstudioapi::isAvailable()) {
   stop("Dieses Skript muss in RStudio mit aktivem rstudioapi laufen.")
@@ -13,6 +186,9 @@ if (!requireNamespace("rstudioapi", quietly = TRUE) || !rstudioapi::isAvailable(
 # ---- 1. Verzeichnisauswahl ----
 root <- rstudioapi::selectDirectory("Wähle Verzeichnis mit YYYY-MM Unterordnern oder direkt einen YYYY-MM-Ordner")
 if (is.null(root)) stop("Abbruch: Kein Ordner gewählt.")
+
+# ---- 1a. Maximale Ziel-Frequenz wählen ----
+target_hz <- prompt_target_frequency(default_hz = 1)
 
 # ---- 2. Regex für Ordner und Dateien ----
 tz_local <- Sys.timezone()
@@ -94,3 +270,68 @@ assign("gps_index", gps_index, envir = .GlobalEnv)
 assign("gps_data", gps_data, envir = .GlobalEnv)
 
 message("✅ Fertig. ", length(gps_data), " Dateien geladen aus ", length(ym_dirs), " Monatsordner(n).")
+
+# ---- 6. Daten reduzieren und zusammenführen ----
+empty_template <- data.table(
+  track_id = integer(),
+  timestamp = as.POSIXct(character(), tz = tz_local),
+  timestamp_ms = character(),
+  lat = numeric(),
+  lon = numeric(),
+  speed_knots = numeric(),
+  speed_kmh = numeric(),
+  source_index = integer(),
+  time_offset_s = numeric()
+)
+
+column_order <- names(empty_template)
+
+parsed_list <- vector("list", length(gps_data))
+resampled_list <- vector("list", length(gps_data))
+
+for (idx in seq_along(gps_data)) {
+  key <- names(gps_data)[idx]
+  lines <- gps_data[[idx]]
+  parsed <- parse_rmc_lines(lines, tz_local)
+
+  if (!is.null(parsed) && nrow(parsed) > 0) {
+    parsed[, track_id := as.integer(gsub("^track_", "", key))]
+    parsed_list[[idx]] <- parsed
+
+    reduced <- downsample_track(parsed, target_hz)
+    if (!is.null(reduced) && nrow(reduced) > 0) {
+      resampled_list[[idx]] <- reduced
+    } else {
+      resampled_list[[idx]] <- empty_template
+    }
+  } else {
+    parsed_list[[idx]] <- empty_template
+    resampled_list[[idx]] <- empty_template
+  }
+}
+
+gps_points_raw <- rbindlist(parsed_list, fill = TRUE)
+gps_points_resampled <- rbindlist(resampled_list, fill = TRUE)
+
+if (nrow(gps_points_raw) > 0L) {
+  missing_cols <- setdiff(column_order, names(gps_points_raw))
+  for (col in missing_cols) set(gps_points_raw, j = col, value = NA)
+  setcolorder(gps_points_raw, column_order)
+}
+
+if (nrow(gps_points_resampled) > 0L) {
+  missing_cols <- setdiff(column_order, names(gps_points_resampled))
+  for (col in missing_cols) set(gps_points_resampled, j = col, value = NA)
+  setcolorder(gps_points_resampled, column_order)
+}
+
+assign("gps_points_raw", gps_points_raw, envir = .GlobalEnv)
+assign("gps_points_resampled", gps_points_resampled, envir = .GlobalEnv)
+assign("gps_resample_hz", target_hz, envir = .GlobalEnv)
+
+message(
+  "✅ Reduzierter Datensatz mit ", target_hz, " Hz erstellt (",
+  nrow(gps_points_resampled), " Punkte).",
+  " Vollständige Punkte befinden sich in 'gps_points_raw'.",
+  " Zusätzliche Zeitstempel mit Millisekunden sind in 'timestamp_ms' verfügbar."
+)
