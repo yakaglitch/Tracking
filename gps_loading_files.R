@@ -97,6 +97,42 @@ downsample_track <- function(track_dt, target_hz) {
   reduced
 }
 
+prompt_target_frequency <- function(default_hz = 1) {
+  freq_values <- c("1 Hz" = 1, "5 Hz" = 5, "10 Hz" = 10)
+
+  if (!interactive()) {
+    message("ℹ️ Skript läuft nicht interaktiv – es wird standardmäßig ", default_hz, " Hz verwendet.")
+    return(default_hz)
+  }
+
+  old_menu_opt <- getOption("menu.graphics")
+  on.exit(options(menu.graphics = old_menu_opt), add = TRUE)
+  options(menu.graphics = FALSE)
+
+  repeat {
+    selection <- utils::menu(
+      choices = names(freq_values),
+      title = paste0(
+        "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung\n",
+        "(0 oder ESC für Abbruch – dann wird der Standardwert ", default_hz, " Hz genutzt)"
+      )
+    )
+
+    if (selection <= 0) {
+      message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
+      return(default_hz)
+    }
+
+    chosen_hz <- unname(freq_values[selection])
+    if (is.finite(chosen_hz) && chosen_hz > 0) {
+      message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen_hz, " Hz.")
+      return(chosen_hz)
+    }
+
+    message("⚠️ Ungültige Auswahl. Bitte erneut versuchen.")
+  }
+}
+
 # Sicherstellen, dass rstudioapi verfügbar ist
 if (!requireNamespace("rstudioapi", quietly = TRUE) || !rstudioapi::isAvailable()) {
   stop("Dieses Skript muss in RStudio mit aktivem rstudioapi laufen.")
@@ -107,21 +143,7 @@ root <- rstudioapi::selectDirectory("Wähle Verzeichnis mit YYYY-MM Unterordnern
 if (is.null(root)) stop("Abbruch: Kein Ordner gewählt.")
 
 # ---- 1a. Maximale Ziel-Frequenz wählen ----
-freq_choices <- c("1 Hz" = "1", "5 Hz" = "5", "10 Hz" = "10")
-freq_selection <- utils::select.list(
-  choices = names(freq_choices),
-  title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
-  multiple = FALSE,
-  preselect = "1 Hz"
-)
-
-if (length(freq_selection) == 0) {
-  target_hz <- 1
-  message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig 1 Hz verwendet.")
-} else {
-  target_hz <- as.numeric(freq_choices[[freq_selection]])
-  message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", target_hz, " Hz.")
-}
+target_hz <- prompt_target_frequency(default_hz = 1)
 
 # ---- 2. Regex für Ordner und Dateien ----
 tz_local <- Sys.timezone()
