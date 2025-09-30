@@ -8,6 +8,7 @@ library(DT)
 library(stringr)
 library(RColorBrewer)
 library(geosphere)
+library(htmltools)
 
 # ===========================
 # Helferfunktionen
@@ -211,6 +212,95 @@ create_poi_dropdown <- function(track_id, field, selected_id, coord_entry, poi_d
   )
 }
 
+route_usage_values <- c("offen", "dienst", "steuer")
+route_usage_labels <- c(
+  offen = "(offen) nicht verwendet",
+  dienst = "Dienstkostenabrechnung",
+  steuer = "Steuerwerbungskosten"
+)
+
+create_usage_dropdown <- function(track_id, selected_value) {
+  if (is.na(selected_value) || !selected_value %in% route_usage_values) {
+    selected_value <- "offen"
+  }
+
+  option_html <- vapply(route_usage_values, function(value) {
+    label <- route_usage_labels[[value]]
+    selected_attr <- if (identical(value, selected_value)) " selected" else ""
+    sprintf('<option value="%s"%s>%s</option>', value, selected_attr, htmltools::htmlEscape(label))
+  }, character(1))
+
+  sprintf(
+    '<select class="usage-select" data-track-id="%s">%s</select>',
+    track_id,
+    paste(option_html, collapse = "")
+  )
+}
+
+format_minutes_to_hm <- function(minutes_total) {
+  minutes_total <- suppressWarnings(as.numeric(minutes_total))
+  if (is.na(minutes_total) || minutes_total <= 0) {
+    return("00:00")
+  }
+
+  hours <- floor(minutes_total / 60)
+  minutes <- round(minutes_total - hours * 60)
+  sprintf("%02d:%02d", hours, minutes)
+}
+
+workspace_state_path <- file.path(getwd(), "workspace_state.rds")
+
+load_workspace_state <- function(path) {
+  if (!file.exists(path)) {
+    return(data.table(id = integer(), route_usage = character(), updated_at = as.POSIXct(character())))
+  }
+
+  state <- tryCatch(readRDS(path), error = function(...) NULL)
+  if (is.null(state) || !is.data.table(state)) {
+    return(data.table(id = integer(), route_usage = character(), updated_at = as.POSIXct(character())))
+  }
+
+  if (!"route_usage" %in% names(state)) {
+    state[, route_usage := "offen"]
+  }
+
+  state[!(route_usage %in% route_usage_values), route_usage := "offen"]
+  state
+}
+
+save_workspace_state <- function(state_dt, path) {
+  dir_path <- dirname(path)
+  if (!dir.exists(dir_path)) {
+    dir.create(dir_path, recursive = TRUE, showWarnings = FALSE)
+  }
+  saveRDS(state_dt, path)
+}
+
+upsert_workspace_state <- function(state_dt, track_id, usage_value) {
+  if (!usage_value %in% route_usage_values) {
+    usage_value <- "offen"
+  }
+
+  if (!is.data.table(state_dt)) {
+    state_dt <- as.data.table(state_dt)
+  }
+
+  if (!"updated_at" %in% names(state_dt)) {
+    state_dt[, updated_at := as.POSIXct(character())]
+  }
+
+  idx <- match(track_id, state_dt$id)
+  now_ts <- Sys.time()
+
+  if (is.na(idx)) {
+    state_dt <- rbind(state_dt, data.table(id = track_id, route_usage = usage_value, updated_at = now_ts), fill = TRUE)
+  } else {
+    state_dt[idx, `:=`(route_usage = usage_value, updated_at = now_ts)]
+  }
+
+  state_dt
+}
+
 # ===========================
 # UI
 # ===========================
@@ -218,13 +308,17 @@ create_poi_dropdown <- function(track_id, field, selected_id, coord_entry, poi_d
 ui <- fluidPage(
   tags$head(
     tags$style(HTML(".dataTables_wrapper td:nth-child(2) { white-space: nowrap; width: 100px; }")),
-    tags$style(HTML("select.poi-select { width: 190px; }"))
+    tags$style(HTML("select.poi-select, select.usage-select { width: 190px; }"))
   ),
   titlePanel("GPS-Logger Viewer mit OSRM & Geschwindigkeitsfarben"),
   fluidRow(
     column(width = 6,
            selectInput("day", "Wähle einen Tag:", choices = NULL),
-           DTOutput("track_table")
+           DTOutput("track_table"),
+           div(
+             style = "margin-top: 10px;",
+             actionButton("daily_report", "Dienstkostenabrechnung für diesen Tag", class = "btn-primary")
+           )
     ),
     column(width = 6,
            leafletOutput("map", height = 700),
@@ -265,7 +359,26 @@ server <- function(input, output, session) {
 
   gps_index_initial <- copy(get("gps_index", envir = .GlobalEnv))
   gps_data          <- get("gps_data",  envir = .GlobalEnv)
-  
+
+  workspace_state_initial <- load_workspace_state(workspace_state_path)
+  workspace_state_rv <- reactiveVal(workspace_state_initial)
+
+  if (!"route_usage" %in% names(gps_index_initial)) {
+    gps_index_initial[, route_usage := "offen"]
+  } else {
+    gps_index_initial[is.na(route_usage) | !(route_usage %in% route_usage_values), route_usage := "offen"]
+  }
+
+  if (nrow(workspace_state_initial) > 0 && "id" %in% names(gps_index_initial)) {
+    match_idx <- match(gps_index_initial$id, workspace_state_initial$id)
+    valid_idx <- which(!is.na(match_idx))
+    if (length(valid_idx) > 0) {
+      matched_usage <- workspace_state_initial$route_usage[match_idx[valid_idx]]
+      matched_usage[is.na(matched_usage) | !(matched_usage %in% route_usage_values)] <- "offen"
+      gps_index_initial[valid_idx, route_usage := matched_usage]
+    }
+  }
+
   # POI-Lookup vorbereiten
   poi_warning <- NULL
   
@@ -335,6 +448,10 @@ server <- function(input, output, session) {
     df[, `OSRM-Zeit` := osrm_duration_hm]
     df[, `Ist-Zeit` := real_duration_hm]
 
+    usage_dropdowns <- vapply(seq_len(nrow(df)), function(i) {
+      create_usage_dropdown(df$id[i], df$route_usage[i])
+    }, character(1))
+
     start_dropdowns <- vapply(seq_len(nrow(df)), function(i) {
       create_poi_dropdown(
         track_id = df$id[i],
@@ -357,12 +474,13 @@ server <- function(input, output, session) {
 
     df[, StartOrt := start_dropdowns]
     df[, ZielOrt := end_dropdowns]
+    df[, Kategorie := usage_dropdowns]
 
     df[, `Anzeigen` := sprintf('<input type="checkbox" id="anzeigen_%d">', index)]
     df[, `OSRM-Route` := sprintf('<input type="checkbox" id="osrm_%d">', index)]
 
-    df <- df[, .(`Anzeigen`, `Fahrtzeit UTC`, StartOrt, ZielOrt, `GPS [km]`, `OSRM [km]`, `OSRM-Zeit`, `Ist-Zeit`, `OSRM-Route`)]
-    
+    df <- df[, .(`Anzeigen`, `Fahrtzeit UTC`, StartOrt, ZielOrt, Kategorie, `GPS [km]`, `OSRM [km]`, `OSRM-Zeit`, `Ist-Zeit`, `OSRM-Route`)]
+
     datatable(
       df,
       escape = FALSE,
@@ -370,31 +488,7 @@ server <- function(input, output, session) {
       rownames = FALSE,
       options = list(dom = 'tip', paging = FALSE, ordering = FALSE, autoWidth = TRUE),
       callback = JS(
-        "table.on('change', 'input', function() {
-var data = {};
-table.rows().every(function(rowIdx) {
-  var row = this.node();
-  var anzeigen = $(row).find('input[id^=\"anzeigen_\"]').prop('checked');
-  var osrm = $(row).find('input[id^=\"osrm_\"]').prop('checked');
-  data[rowIdx] = { anzeigen: anzeigen, osrm: osrm };
-});
-Shiny.setInputValue('checkbox_data', data, {priority: 'event'});
-});
-
-table.on('change', 'select.poi-select', function() {
-  var select = $(this);
-  var trackId = parseInt(select.data('track-id'), 10);
-  var field = select.data('field');
-  var value = select.val();
-  if (isNaN(trackId)) {
-    return;
-  }
-  Shiny.setInputValue('poi_update', {
-    track_id: trackId,
-    field: field,
-    value: value || ''
-  }, {priority: 'event'});
-});"
+        "table.on('change', 'input', function() {\nvar data = {};\ntable.rows().every(function(rowIdx) {\n  var row = this.node();\n  var anzeigen = $(row).find('input[id^=\\\"anzeigen_\\\"]').prop('checked');\n  var osrm = $(row).find('input[id^=\\\"osrm_\\\"]').prop('checked');\n  data[rowIdx] = { anzeigen: anzeigen, osrm: osrm };\n});\nShiny.setInputValue('checkbox_data', data, {priority: 'event'});\n});\n\ntable.on('change', 'select.poi-select', function() {\n  var select = $(this);\n  var trackId = parseInt(select.data('track-id'), 10);\n  var field = select.data('field');\n  var value = select.val();\n  if (isNaN(trackId)) {\n    return;\n  }\n  Shiny.setInputValue('poi_update', {\n    track_id: trackId,\n    field: field,\n    value: value || ''\n  }, {priority: 'event'});\n});\n\ntable.on('change', 'select.usage-select', function() {\n  var select = $(this);\n  var trackId = parseInt(select.data('track-id'), 10);\n  var value = select.val() || 'offen';\n  if (isNaN(trackId)) {\n    return;\n  }\n  Shiny.setInputValue('usage_update', {\n    track_id: trackId,\n    value: value\n  }, {priority: 'event'});\n});"
       )
     ) %>%
       formatStyle("Fahrtzeit UTC", target = 'row', fontWeight = 'bold')
@@ -486,6 +580,88 @@ table.on('change', 'select.poi-select', function() {
     current_index[id == track_id, (score_name) := new_score]
     gps_index_rv(current_index)
     assign("gps_index", current_index, envir = .GlobalEnv)
+  })
+
+  observeEvent(input$usage_update, {
+    update <- input$usage_update
+    req(update$track_id)
+
+    track_id <- suppressWarnings(as.integer(update$track_id))
+    if (is.na(track_id)) return()
+
+    usage_value <- update$value
+    if (is.null(usage_value) || !usage_value %in% route_usage_values) {
+      usage_value <- "offen"
+    }
+
+    current_index <- copy(gps_index_rv())
+    if (!track_id %in% current_index$id) return()
+
+    current_index[id == track_id, route_usage := usage_value]
+    gps_index_rv(current_index)
+    assign("gps_index", current_index, envir = .GlobalEnv)
+
+    workspace_state <- upsert_workspace_state(workspace_state_rv(), track_id, usage_value)
+    workspace_state_rv(workspace_state)
+    save_workspace_state(workspace_state, workspace_state_path)
+  })
+
+  poi_name_lookup <- function(poi_id) {
+    if (is.null(poi_id) || all(is.na(poi_id))) {
+      return("(unbekannt)")
+    }
+
+    poi_id_num <- suppressWarnings(as.integer(poi_id[1]))
+    if (is.na(poi_id_num)) {
+      return("(unbekannt)")
+    }
+
+    match_row <- poi_table[id == poi_id_num]
+    if (nrow(match_row) > 0 && !is.na(match_row$name[1])) {
+      return(as.character(match_row$name[1]))
+    }
+
+    sprintf("POI #%s", poi_id_num)
+  }
+
+  observeEvent(input$daily_report, {
+    df <- copy(day_subset())
+    if (nrow(df) == 0) {
+      cat(sprintf("\n[Dienstkostenabrechnung] %s: Keine Fahrten gefunden.\n", input$day))
+      return()
+    }
+
+    dienst_df <- df[route_usage == "dienst"]
+    if (nrow(dienst_df) == 0) {
+      cat(sprintf("\n[Dienstkostenabrechnung] %s: Keine Fahrten für die Dienstkostenabrechnung markiert.\n", input$day))
+      return()
+    }
+
+    start_names <- vapply(dienst_df$poi_start_id, poi_name_lookup, character(1))
+    end_names   <- vapply(dienst_df$poi_end_id, poi_name_lookup, character(1))
+
+    distance_km <- suppressWarnings(as.numeric(dienst_df$travel_distance_m) / 1000)
+    distance_km[is.na(distance_km)] <- 0
+
+    report_dt <- data.table(
+      Datum = format(dienst_df$start_time, "%Y-%m-%d"),
+      `Fahrtzeit` = paste(format(dienst_df$start_time, "%H:%M"), "–", format(dienst_df$end_time, "%H:%M")),
+      Start = start_names,
+      Ziel = end_names,
+      Kilometer = sprintf("%.1f", distance_km),
+      `Kilometer-Quelle` = "GPS",
+      `Ist-Zeit` = dienst_df$real_duration_hm
+    )
+
+    total_distance <- sum(distance_km, na.rm = TRUE)
+    total_minutes <- sum(as.numeric(difftime(dienst_df$end_time, dienst_df$start_time, units = "mins")), na.rm = TRUE)
+
+    cat("\n================ Dienstkostenabrechnung =================\n")
+    cat(sprintf("Tag: %s\n", input$day))
+    print(report_dt)
+    cat(sprintf("Gesamtstrecke: %.1f km (Quelle: GPS)\n", total_distance))
+    cat(sprintf("Gesamte Fahrzeit: %s Stunden\n", format_minutes_to_hm(total_minutes)))
+    cat("========================================================\n")
   })
   
   output$map <- renderLeaflet({
