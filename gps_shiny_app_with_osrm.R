@@ -11,6 +11,82 @@ library(geosphere)
 library(htmltools)
 
 # ===========================
+# Initialisierung des App-Verzeichnisses und Startskripte
+# ===========================
+
+detect_app_root <- function() {
+  cmd_args <- commandArgs(trailingOnly = FALSE)
+  file_arg <- "--file="
+  file_idx <- grep(file_arg, cmd_args, fixed = TRUE)
+  if (length(file_idx) > 0) {
+    candidate <- sub(file_arg, "", cmd_args[file_idx[1]])
+    if (nzchar(candidate)) {
+      candidate_path <- tryCatch(normalizePath(candidate, mustWork = TRUE), error = function(...) NULL)
+      if (!is.null(candidate_path)) {
+        return(dirname(candidate_path))
+      }
+    }
+  }
+
+  frames <- sys.frames()
+  for (i in rev(seq_along(frames))) {
+    frame <- frames[[i]]
+    if (!is.null(frame$ofile)) {
+      candidate_path <- tryCatch(normalizePath(frame$ofile, mustWork = TRUE), error = function(...) NULL)
+      if (!is.null(candidate_path)) {
+        return(dirname(candidate_path))
+      }
+    }
+  }
+
+  tryCatch(normalizePath(getwd(), mustWork = FALSE), error = function(...) getwd())
+}
+
+app_root_dir <- detect_app_root()
+options(gps_app.root_dir = app_root_dir)
+
+resolve_app_path <- function(...) {
+  file.path(app_root_dir, ...)
+}
+
+run_app_startup_scripts <- local({
+  executed <- FALSE
+
+  function(force = FALSE) {
+    if (!force && isTRUE(executed)) {
+      return(invisible(TRUE))
+    }
+
+    scripts <- c(
+      "gps_loading_files.R",
+      "travel_distance_add.R",
+      "osrm_distance.R",
+      "POI_init.R"
+    )
+
+    for (script in scripts) {
+      script_path <- resolve_app_path(script)
+
+      if (!file.exists(script_path)) {
+        message(sprintf("⚠️  Startskript nicht gefunden: %s", script_path))
+        next
+      }
+
+      message(sprintf("▶️  Führe Startskript aus: %s", script))
+      tryCatch(
+        source(script_path, local = .GlobalEnv),
+        error = function(err) {
+          warning(sprintf("Fehler beim Ausführen von %s: %s", script, conditionMessage(err)), call. = FALSE)
+        }
+      )
+    }
+
+    executed <<- TRUE
+    invisible(TRUE)
+  }
+})
+
+# ===========================
 # Helferfunktionen
 # ===========================
 
@@ -291,7 +367,9 @@ format_minutes_to_hm <- function(minutes_total) {
   sprintf("%02d:%02d", hours, minutes)
 }
 
-workspace_state_path <- file.path(getwd(), "workspace_state.rds")
+workspace_state_path <- resolve_app_path("workspace_state.rds")
+
+run_app_startup_scripts()
 
 empty_workspace_state <- function() {
   data.table(
