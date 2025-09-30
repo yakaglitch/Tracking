@@ -56,6 +56,66 @@ parse_osrm_route <- function(route_raw) {
   return(coords_dt)
 }
 
+track_cache_env <- new.env(parent = emptyenv())
+osrm_cache_env  <- new.env(parent = emptyenv())
+
+get_cached_track_coords <- function(track_id, gps_data_env) {
+  cache_key <- paste0("track_", track_id)
+  if (exists(cache_key, envir = track_cache_env, inherits = FALSE)) {
+    return(track_cache_env[[cache_key]])
+  }
+
+  lines <- gps_data_env[[cache_key]]
+  if (is.null(lines)) return(NULL)
+
+  coords <- parse_nmea_with_speed(lines)
+  track_cache_env[[cache_key]] <- coords
+  coords
+}
+
+get_cached_osrm_coords <- function(track_id, gps_index_dt) {
+  cache_key <- paste0("route_", track_id)
+  if (exists(cache_key, envir = osrm_cache_env, inherits = FALSE)) {
+    return(osrm_cache_env[[cache_key]])
+  }
+
+  if (!"osrm_route_coords" %in% names(gps_index_dt)) return(NULL)
+
+  route_raw <- gps_index_dt[id == track_id]$osrm_route_coords[[1]]
+  coords <- parse_osrm_route(route_raw)
+  osrm_cache_env[[cache_key]] <- coords
+  coords
+}
+
+add_speed_segments_to_map <- function(proxy, coords) {
+  if (is.null(coords) || nrow(coords) < 2) return(proxy)
+
+  segment_colors <- vapply(coords$speed[-1], get_speed_color, character(1))
+  if (!length(segment_colors)) return(proxy)
+
+  color_rle <- rle(segment_colors)
+  start_idx <- 1
+
+  for (i in seq_along(color_rle$values)) {
+    segment_length <- color_rle$lengths[i]
+    end_idx <- start_idx + segment_length
+    idx_range <- start_idx:end_idx
+
+    proxy <- proxy |> addPolylines(
+      lng = coords$lon[idx_range],
+      lat = coords$lat[idx_range],
+      color = color_rle$values[i],
+      weight = 4,
+      opacity = 0.9,
+      group = "gps_tracks"
+    )
+
+    start_idx <- end_idx
+  }
+
+  proxy
+}
+
 extract_lat_lon <- function(coord_entry) {
   if (is.null(coord_entry)) {
     return(c(NA_real_, NA_real_))
@@ -164,7 +224,6 @@ ui <- fluidPage(
   fluidRow(
     column(width = 6,
            selectInput("day", "Wähle einen Tag:", choices = NULL),
-           actionButton("apply_selection", "Auf Karte anwenden"),
            DTOutput("track_table")
     ),
     column(width = 6,
@@ -319,7 +378,7 @@ table.rows().every(function(rowIdx) {
   var osrm = $(row).find('input[id^=\"osrm_\"]').prop('checked');
   data[rowIdx] = { anzeigen: anzeigen, osrm: osrm };
 });
-Shiny.setInputValue('checkbox_data', data);
+Shiny.setInputValue('checkbox_data', data, {priority: 'event'});
 });
 
 table.on('change', 'select.poi-select', function() {
@@ -341,19 +400,33 @@ table.on('change', 'select.poi-select', function() {
       formatStyle("Fahrtzeit UTC", target = 'row', fontWeight = 'bold')
   })
   
-  observeEvent(input$apply_selection, {
-    raw <- input$checkbox_data
-    if (is.null(raw)) return()
-
+  observeEvent(day_subset(), {
     df <- day_subset()
+    if (nrow(df) == 0) {
+      selected_table(NULL)
+    } else {
+      selected_table(data.table(id = df$id, anzeigen = FALSE, osrm = FALSE))
+    }
+  }, ignoreNULL = FALSE)
+
+  observeEvent(input$checkbox_data, {
+    df <- day_subset()
+    if (nrow(df) == 0) {
+      selected_table(NULL)
+      return()
+    }
+
+    raw <- input$checkbox_data
     anzeigen_flags <- rep(FALSE, nrow(df))
     osrm_flags <- rep(FALSE, nrow(df))
 
-    for (i in seq_len(nrow(df))) {
-      entry <- raw[[as.character(i - 1)]]
-      if (!is.null(entry)) {
-        anzeigen_flags[i] <- isTRUE(entry$anzeigen)
-        osrm_flags[i]     <- isTRUE(entry$osrm)
+    if (!is.null(raw)) {
+      for (i in seq_len(nrow(df))) {
+        entry <- raw[[as.character(i - 1)]]
+        if (!is.null(entry)) {
+          anzeigen_flags[i] <- isTRUE(entry$anzeigen)
+          osrm_flags[i]     <- isTRUE(entry$osrm)
+        }
       }
     }
 
@@ -362,7 +435,7 @@ table.on('change', 'select.poi-select', function() {
       anzeigen = anzeigen_flags,
       osrm = osrm_flags
     ))
-  })
+  }, ignoreNULL = FALSE)
 
   observeEvent(input$poi_update, {
     update <- input$poi_update
@@ -443,61 +516,56 @@ table.on('change', 'select.poi-select', function() {
   }, ignoreNULL = FALSE)
   
   observe({
-    leafletProxy("map") |> clearShapes()
+    proxy <- leafletProxy("map")
+    proxy <- proxy |> clearGroup("gps_tracks")
+    proxy <- proxy |> clearGroup("osrm_routes")
+
     selection <- selected_table()
-    if (is.null(selection)) return()
-    
+    if (is.null(selection) || nrow(selection) == 0) return()
+
     all_coords <- list()
-    
+    current_index <- gps_index_rv()
+
     for (i in seq_len(nrow(selection))) {
       sel <- selection[i]
       id <- sel$id
-      
-      if (sel$anzeigen) {
-        key <- paste0("track_", id)
-        lines <- gps_data[[key]]
-        coords <- parse_nmea_with_speed(lines)
-        
+
+      if (isTRUE(sel$anzeigen)) {
+        coords <- get_cached_track_coords(id, gps_data)
         if (!is.null(coords) && nrow(coords) > 1) {
-          for (j in 2:nrow(coords)) {
-            color <- get_speed_color(coords$speed[j])
-            leafletProxy("map") |> addPolylines(
-              lng = coords$lon[(j - 1):j],
-              lat = coords$lat[(j - 1):j],
-              color = color,
-              weight = 4,
-              opacity = 0.9
-            )
-          }
+          proxy <- add_speed_segments_to_map(proxy, coords)
           all_coords[[length(all_coords) + 1]] <- coords
         }
       }
 
-      if (sel$osrm) {
-        current_index <- gps_index_rv()
-        route_raw <- current_index[id == sel$id]$osrm_route_coords[[1]]
-        coords_dt <- parse_osrm_route(route_raw)
+      if (isTRUE(sel$osrm)) {
+        coords_dt <- get_cached_osrm_coords(id, current_index)
         if (!is.null(coords_dt)) {
-          leafletProxy("map") |> addPolylines(
+          proxy <- proxy |> addPolylines(
             lng = coords_dt$lon,
             lat = coords_dt$lat,
             color = "black",
             weight = 2,
             opacity = 0.6,
-            dashArray = "5,5"
+            dashArray = "5,5",
+            group = "osrm_routes"
           )
+          all_coords[[length(all_coords) + 1]] <- coords_dt
         }
       }
     }
-    
+
     if (length(all_coords) > 0) {
-      all_coords_dt <- rbindlist(all_coords)
-      leafletProxy("map") |> fitBounds(
-        min(all_coords_dt$lon, na.rm = TRUE),
-        min(all_coords_dt$lat, na.rm = TRUE),
-        max(all_coords_dt$lon, na.rm = TRUE),
-        max(all_coords_dt$lat, na.rm = TRUE)
-      )
+      all_coords_dt <- rbindlist(all_coords, fill = TRUE)
+      valid_coords <- all_coords_dt[!is.na(lat) & !is.na(lon)]
+      if (nrow(valid_coords) > 0) {
+        proxy |> fitBounds(
+          min(valid_coords$lon, na.rm = TRUE),
+          min(valid_coords$lat, na.rm = TRUE),
+          max(valid_coords$lon, na.rm = TRUE),
+          max(valid_coords$lat, na.rm = TRUE)
+        )
+      }
     }
   })
 }
