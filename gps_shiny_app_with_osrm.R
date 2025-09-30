@@ -106,26 +106,37 @@ server <- function(input, output, session) {
   req(exists("gps_data", envir = .GlobalEnv))
 
   gps_index <- get("gps_index", envir = .GlobalEnv)
-  gps_data <- get("gps_data", envir = .GlobalEnv)
+  gps_data  <- get("gps_data",  envir = .GlobalEnv)
 
-  poi_lookup <- data.table(id = integer(), name = character())
+  # POI-Lookup vorbereiten
+  poi_lookup  <- data.table(id = integer(), name = character())
   poi_warning <- NULL
+
   if (exists("poi_table", envir = .GlobalEnv)) {
     poi_table <- get("poi_table", envir = .GlobalEnv)
     if (all(c("id", "name") %in% names(poi_table))) {
       poi_lookup <- poi_table[, .(id, name)]
     } else {
       poi_warning <- "POI-Tabelle ohne 'id'/'name'-Spalten gefunden. Es wird eine leere Tabelle verwendet."
+      poi_table   <- data.table(id = integer(), name = character())
     }
   } else {
     poi_warning <- "POI-Tabelle nicht gefunden. Es wird eine leere Tabelle verwendet."
+    poi_table   <- data.table(id = integer(), name = character())
   }
 
   if (!is.null(poi_warning)) {
     showNotification(poi_warning, type = "warning")
   }
+
+  # Tag-Spalte für Auswahl aufbereiten
   gps_index[, tag := format(start_time, "%Y-%m-%d")]
-  updateSelectInput(session, "day", choices = unique(gps_index$tag), selected = unique(gps_index$tag)[1])
+  updateSelectInput(
+    session,
+    "day",
+    choices  = unique(gps_index$tag),
+    selected = unique(gps_index$tag)[1]
+  )
   
   selected_table <- reactiveVal(NULL)
   
