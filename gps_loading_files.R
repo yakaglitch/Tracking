@@ -78,16 +78,15 @@ parse_rmc_lines <- function(nmea_lines, tz) {
   coords <- rbindlist(entries, fill = TRUE)
   if (nrow(coords) == 0) return(NULL)
   setorder(coords, timestamp, source_index)
-  coords[, time_offset_s := as.numeric(timestamp - timestamp[1])]
   coords[, timestamp_ms := format(timestamp, "%Y-%m-%d %H:%M:%OS3", tz = tz)]
-  setcolorder(coords, c("timestamp", "timestamp_ms", "lat", "lon", "speed_knots", "speed_kmh", "source_index", "time_offset_s"))
+  setcolorder(coords, c("timestamp", "timestamp_ms", "lat", "lon", "speed_knots", "speed_kmh", "source_index"))
   coords
 }
 
 downsample_track <- function(track_dt, target_hz) {
   if (is.null(track_dt) || nrow(track_dt) == 0) return(copy(track_dt))
   if (!is.finite(target_hz) || target_hz <= 0) return(copy(track_dt))
-  
+
   secs <- as.numeric(track_dt$timestamp)
   if (anyNA(secs)) return(copy(track_dt))
   
@@ -95,7 +94,6 @@ downsample_track <- function(track_dt, target_hz) {
   diffs <- diffs[diffs > 0]
   if (length(diffs) == 0) {
     result <- copy(track_dt[1])
-    result[, time_offset_s := 0]
     if (!"timestamp_ms" %in% names(result)) {
       tz <- attr(track_dt$timestamp, "tzone")
       if (is.null(tz)) tz <- ""
@@ -107,7 +105,6 @@ downsample_track <- function(track_dt, target_hz) {
   actual_hz <- 1 / median(diffs)
   if (!is.finite(actual_hz) || actual_hz <= target_hz + 1e-9) {
     result <- copy(track_dt)
-    result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
     if (!"timestamp_ms" %in% names(result)) {
       tz <- attr(track_dt$timestamp, "tzone")
       if (is.null(tz)) tz <- ""
@@ -122,13 +119,11 @@ downsample_track <- function(track_dt, target_hz) {
   
   if (all(keep)) {
     result <- copy(track_dt)
-    result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
     return(result)
   }
-  
+
   reduced <- track_dt[keep]
   result <- copy(reduced)
-  result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
   if (!"timestamp_ms" %in% names(result)) {
     tz <- attr(track_dt$timestamp, "tzone")
     if (is.null(tz)) tz <- ""
@@ -137,9 +132,94 @@ downsample_track <- function(track_dt, target_hz) {
   result
 }
 
+parse_tracks_parallel <- function(gps_data, tz_local, empty_template) {
+  if (length(gps_data) == 0) return(vector("list", 0))
+
+  keys <- names(gps_data)
+  if (is.null(keys)) keys <- as.character(seq_along(gps_data))
+
+  parse_idx <- function(idx) {
+    lines <- gps_data[[idx]]
+    parsed <- parse_rmc_lines(lines, tz_local)
+
+    if (!is.null(parsed) && nrow(parsed) > 0L) {
+      parsed[, track_id := as.integer(gsub("^track_", "", keys[[idx]]))]
+      parsed
+    } else {
+      copy(empty_template)
+    }
+  }
+
+  determine_cores <- function() {
+    cores_from_option <- getOption("gps_loader.cores")
+    cores_from_env <- Sys.getenv("GPS_LOADER_CORES", "")
+
+    parse_int <- function(x) {
+      if (length(x) == 0 || is.null(x) || identical(x, "")) return(NA_integer_)
+      suppressWarnings(as.integer(x))
+    }
+
+    desired <- parse_int(cores_from_option)
+    if (is.na(desired)) desired <- parse_int(cores_from_env)
+
+    available <- suppressWarnings(as.integer(parallel::detectCores(logical = FALSE)))
+    if (is.na(available) || available < 1L) available <- 1L
+
+    if (is.na(desired) || desired < 1L) {
+      desired <- max(1L, available - 1L)
+    }
+
+    max(1L, min(desired, available, length(gps_data)))
+  }
+
+  cores <- determine_cores()
+  if (cores <= 1L) {
+    return(lapply(seq_along(gps_data), parse_idx))
+  }
+
+  message("ℹ️ Verwende ", cores, " Kern(e) zum Parsen der GPS-Tracks.")
+
+  if (.Platform$OS.type == "windows") {
+    cl <- parallel::makeCluster(cores)
+    on.exit(parallel::stopCluster(cl), add = TRUE)
+    parallel::clusterEvalQ(cl, { library(data.table); NULL })
+    result <- parallel::parLapply(
+      cl,
+      seq_along(gps_data),
+      function(idx, keys, gps_data, tz_local, empty_template, parse_fun) {
+        lines <- gps_data[[idx]]
+        parsed <- parse_fun(lines, tz_local)
+        if (!is.null(parsed) && nrow(parsed) > 0L) {
+          parsed[, track_id := as.integer(gsub("^track_", "", keys[[idx]]))]
+          parsed
+        } else {
+          data.table::copy(empty_template)
+        }
+      },
+      keys,
+      gps_data,
+      tz_local,
+      empty_template,
+      parse_rmc_lines
+    )
+    return(result)
+  }
+
+  parallel::mclapply(seq_along(gps_data), function(idx) {
+    lines <- gps_data[[idx]]
+    parsed <- parse_rmc_lines(lines, tz_local)
+    if (!is.null(parsed) && nrow(parsed) > 0L) {
+      parsed[, track_id := as.integer(gsub("^track_", "", keys[[idx]]))]
+      parsed
+    } else {
+      copy(empty_template)
+    }
+  }, mc.cores = cores)
+}
+
 prompt_target_frequency <- function(default_hz = 1) {
   freq_values <- c("1 Hz" = 1, "5 Hz" = 5, "10 Hz" = 10)
-  
+
   if (!interactive()) {
     message("ℹ️ Skript läuft nicht interaktiv – es wird standardmäßig ", default_hz, " Hz verwendet.")
     return(default_hz)
@@ -288,25 +368,14 @@ empty_template <- data.table(
   lon = numeric(),
   speed_knots = numeric(),
   speed_kmh = numeric(),
-  source_index = integer(),
-  time_offset_s = numeric()
+  source_index = integer()
 )
 
 column_order <- names(empty_template)
 
-parsed_list <- vector("list", length(gps_data))
-
-for (idx in seq_along(gps_data)) {
-  key <- names(gps_data)[idx]
-  lines <- gps_data[[idx]]
-  parsed <- parse_rmc_lines(lines, tz_local)
-  
-  if (!is.null(parsed) && nrow(parsed) > 0) {
-    parsed[, track_id := as.integer(gsub("^track_", "", key))]
-    parsed_list[[idx]] <- parsed
-  } else {
-    parsed_list[[idx]] <- copy(empty_template)
-  }
+parsed_list <- parse_tracks_parallel(gps_data, tz_local, empty_template)
+if (length(parsed_list) > 0) {
+  names(parsed_list) <- names(gps_data)
 }
 
 gps_points_raw <- rbindlist(parsed_list, fill = TRUE)
