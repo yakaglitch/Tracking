@@ -150,10 +150,13 @@ Damit die Shiny-App inklusive OSRM-Routen ohne Fehlermeldungen startet, müssen 
    - Skript ausführen, um zu jeder Fahrt Distanz, Dauer und Koordinaten der optimalen Route zu ermitteln (`osrm_distance_m`, `osrm_duration_s`, `osrm_route_coords`).
 
 5. **POI-Tabelle bereitstellen**
-   - Die Shiny-App erwartet ein Objekt `poi_table` mit mindestens den Spalten `id` und `name` für Start-/Zielbezeichnungen. Lade oder erstelle diese Tabelle vor dem Start (z. B. aus einer CSV einlesen und als `data.table` speichern).
+   - Die Shiny-App erwartet ein Objekt `poi_table` mit mindestens den Spalten `id` und `name` für Start-/Zielbezeichnungen.
+   - Empfohlen: `source("POI_init.R")`, um die Datei `POI_R.xlsx` einzulesen, Spalten zu typisieren und optionale Start-/Ziel-Scores in `gps_index` zu ergänzen.
+   - Alternativ kann eine eigene Tabelle aufgebaut werden (z. B. CSV einlesen und als `data.table` speichern).
+   - Falls beim Start der Shiny-App keine `poi_table` gefunden wird, fällt die Anwendung automatisch auf eine leere Tabelle zurück und zeigt einen Warnhinweis – die App bleibt lauffähig, jedoch ohne benannte Start-/Zielorte.
 
 6. **Shiny-App starten – `gps_shiny_app_with_osrm.R`**
    - Nach erfolgreichem Abschluss der Schritte 2–5 `source("gps_shiny_app_with_osrm.R")` ausführen.
    - Die App liest `gps_index`, `gps_data` und `poi_table` aus dem `.GlobalEnv` und ermöglicht das Ein- und Ausblenden von GPS-Tracks sowie OSRM-Routen inklusive farblicher Geschwindigkeitsdarstellung.
 
-**Tipp:** Sollte eines der Objekte fehlen, brechen die Skripte bewusst mit einer Fehlermeldung ab. Das hilft, eine inkonsistente Reihenfolge schnell zu erkennen.
+**Tipp:** Sollte eines der Kernobjekte (`gps_index`, `gps_data`) fehlen, brechen die Skripte bewusst mit einer Fehlermeldung ab. Für `poi_table` wird automatisch eine leere Fallback-Tabelle erzeugt, falls keine Daten bereitstehen.
