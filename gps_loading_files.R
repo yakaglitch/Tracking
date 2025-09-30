@@ -99,10 +99,29 @@ downsample_track <- function(track_dt, target_hz) {
 
 prompt_target_frequency <- function(default_hz = 1) {
   freq_values <- c("1 Hz" = 1, "5 Hz" = 5, "10 Hz" = 10)
+  default_label <- names(freq_values)[match(default_hz, freq_values)]
 
   if (!interactive()) {
     message("ℹ️ Skript läuft nicht interaktiv – es wird standardmäßig ", default_hz, " Hz verwendet.")
     return(default_hz)
+  }
+
+  if (rstudioapi::isAvailable() && rstudioapi::hasFun("selectList")) {
+    selection <- rstudioapi::selectList(
+      choices = names(freq_values),
+      title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
+      selected = default_label,
+      multiple = FALSE
+    )
+
+    if (length(selection) == 0) {
+      message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
+      return(default_hz)
+    }
+
+    chosen <- freq_values[[selection]]
+    message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen, " Hz.")
+    return(chosen)
   }
 
   old_menu_opt <- getOption("menu.graphics")
