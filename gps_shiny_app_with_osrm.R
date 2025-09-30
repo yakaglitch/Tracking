@@ -56,13 +56,109 @@ parse_osrm_route <- function(route_raw) {
   return(coords_dt)
 }
 
+extract_lat_lon <- function(coord_entry) {
+  if (is.null(coord_entry)) {
+    return(c(NA_real_, NA_real_))
+  }
+
+  lat <- NA_real_
+  lon <- NA_real_
+
+  if (is.list(coord_entry) && !is.data.frame(coord_entry)) {
+    if (!is.null(coord_entry$lat) && !is.null(coord_entry$lon)) {
+      lat <- suppressWarnings(as.numeric(coord_entry$lat[1]))
+      lon <- suppressWarnings(as.numeric(coord_entry$lon[1]))
+    } else if (length(coord_entry) >= 2) {
+      lat <- suppressWarnings(as.numeric(coord_entry[[1]]))
+      lon <- suppressWarnings(as.numeric(coord_entry[[2]]))
+    }
+  } else if (is.list(coord_entry) && is.data.frame(coord_entry)) {
+    if (all(c("lat", "lon") %in% names(coord_entry))) {
+      lat <- suppressWarnings(as.numeric(coord_entry$lat[1]))
+      lon <- suppressWarnings(as.numeric(coord_entry$lon[1]))
+    }
+  } else if (is.atomic(coord_entry) && length(coord_entry) >= 2) {
+    lat <- suppressWarnings(as.numeric(coord_entry[1]))
+    lon <- suppressWarnings(as.numeric(coord_entry[2]))
+  }
+
+  c(lat, lon)
+}
+
+prepare_poi_choices <- function(ref_lat, ref_lon, poi_dt) {
+  if (nrow(poi_dt) == 0) {
+    return(data.table(id = integer(), name = character(), dist_m = numeric()))
+  }
+
+  poi_valid <- copy(poi_dt[!is.na(lat) & !is.na(lon)])
+  if (nrow(poi_valid) == 0 || any(is.na(c(ref_lat, ref_lon)))) {
+    ordered_idx <- order(poi_dt$name)
+    return(data.table(
+      id = poi_dt$id[ordered_idx],
+      name = poi_dt$name[ordered_idx],
+      dist_m = rep(NA_real_, length(ordered_idx))
+    ))
+  }
+
+  coords <- matrix(c(poi_valid$lon, poi_valid$lat), ncol = 2)
+  distances <- distHaversine(coords, c(ref_lon, ref_lat))
+  poi_valid[, dist_m := distances]
+  ordered <- rbindlist(list(
+    poi_valid[order(dist_m, na.last = TRUE)],
+    copy(poi_dt[is.na(lat) | is.na(lon)])
+  ), fill = TRUE)
+
+  if (!"dist_m" %in% names(ordered)) {
+    ordered[, dist_m := NA_real_]
+  }
+
+  ordered[, .(id = id, name = name, dist_m = dist_m)]
+}
+
+create_poi_dropdown <- function(track_id, field, selected_id, coord_entry, poi_dt) {
+  lat_lon <- extract_lat_lon(coord_entry)
+  choices <- prepare_poi_choices(lat_lon[1], lat_lon[2], poi_dt)
+
+  option_html <- '<option value="">(unbekannt)</option>'
+  if (nrow(choices) > 0) {
+    option_html <- c(option_html, vapply(seq_len(nrow(choices)), function(i) {
+      poi_id <- choices$id[i]
+      poi_name <- choices$name[i]
+      dist_val <- choices$dist_m[i]
+      label <- htmltools::htmlEscape(poi_name)
+      if (!is.na(dist_val)) {
+        label <- sprintf("%s (%.0f m)", label, dist_val)
+      }
+      selected_attr <- if (!is.na(selected_id) && poi_id == selected_id) " selected" else ""
+      sprintf('<option value="%s"%s>%s</option>', poi_id, selected_attr, label)
+    }, character(1)))
+  } else {
+    if (!is.na(selected_id)) {
+      option_html <- c(option_html, sprintf('<option value="%s" selected>(unbekannt)</option>', selected_id))
+    }
+  }
+
+  if (!is.na(selected_id) && !(selected_id %in% choices$id)) {
+    fallback_label <- sprintf("Manuelle Auswahl (ID %s)", selected_id)
+    option_html <- c(option_html, sprintf('<option value="%s" selected>%s</option>', selected_id, htmltools::htmlEscape(fallback_label)))
+  }
+
+  sprintf(
+    '<select class="poi-select" data-track-id="%s" data-field="%s">%s</select>',
+    track_id,
+    field,
+    paste(option_html, collapse = "")
+  )
+}
+
 # ===========================
 # UI
 # ===========================
 
 ui <- fluidPage(
   tags$head(
-    tags$style(HTML(".dataTables_wrapper td:nth-child(2) { white-space: nowrap; width: 100px; }"))
+    tags$style(HTML(".dataTables_wrapper td:nth-child(2) { white-space: nowrap; width: 100px; }")),
+    tags$style(HTML("select.poi-select { width: 190px; }"))
   ),
   titlePanel("GPS-Logger Viewer mit OSRM & Geschwindigkeitsfarben"),
   fluidRow(
@@ -107,18 +203,16 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   req(exists("gps_index", envir = .GlobalEnv))
   req(exists("gps_data", envir = .GlobalEnv))
-  
-  gps_index <- get("gps_index", envir = .GlobalEnv)
-  gps_data  <- get("gps_data",  envir = .GlobalEnv)
+
+  gps_index_initial <- copy(get("gps_index", envir = .GlobalEnv))
+  gps_data          <- get("gps_data",  envir = .GlobalEnv)
   
   # POI-Lookup vorbereiten
-  poi_lookup  <- data.table(id = integer(), name = character())
   poi_warning <- NULL
   
   if (exists("poi_table", envir = .GlobalEnv)) {
     poi_table <- get("poi_table", envir = .GlobalEnv)
     if (all(c("id", "name") %in% names(poi_table))) {
-      poi_lookup <- poi_table[, .(id, name)]
       poi_table[, poi_color := "blue"]
       
       kategorie_col <- names(poi_table)[tolower(names(poi_table)) == "kategorie"]
@@ -132,13 +226,20 @@ server <- function(input, output, session) {
         typ_clean <- tolower(trimws(poi_table[[typ_col[1]]]))
         poi_table[!is.na(typ_clean) & typ_clean == "zuhause" & poi_color != "red", poi_color := "green"]
       }
+
+      if (!"lat" %in% names(poi_table)) poi_table[, lat := NA_real_]
+      if (!"lon" %in% names(poi_table)) poi_table[, lon := NA_real_]
+      if (!"range" %in% names(poi_table)) poi_table[, range := NA_real_]
+      poi_table[, lat := suppressWarnings(as.numeric(lat))]
+      poi_table[, lon := suppressWarnings(as.numeric(lon))]
+      poi_table[, range := suppressWarnings(as.numeric(range))]
     } else {
       poi_warning <- "POI-Tabelle ohne 'id'/'name'-Spalten gefunden. Es wird eine leere Tabelle verwendet."
-      poi_table   <- data.table(id = integer(), name = character(), poi_color = character())
+      poi_table   <- data.table(id = integer(), name = character(), poi_color = character(), lat = numeric(), lon = numeric(), range = numeric())
     }
   } else {
     poi_warning <- "POI-Tabelle nicht gefunden. Es wird eine leere Tabelle verwendet."
-    poi_table   <- data.table(id = integer(), name = character(), poi_color = character())
+    poi_table   <- data.table(id = integer(), name = character(), poi_color = character(), lat = numeric(), lon = numeric(), range = numeric())
   }
   
   if (!is.null(poi_warning)) {
@@ -146,49 +247,61 @@ server <- function(input, output, session) {
   }
   
   # Tag-Spalte für Auswahl aufbereiten
-  gps_index[, tag := format(start_time, "%Y-%m-%d")]
+  gps_index_initial[, tag := format(start_time, "%Y-%m-%d")]
+  gps_index_rv <- reactiveVal(gps_index_initial)
+  assign("gps_index", gps_index_initial, envir = .GlobalEnv)
   updateSelectInput(
     session,
     "day",
-    choices  = unique(gps_index$tag),
-    selected = unique(gps_index$tag)[1]
+    choices  = unique(gps_index_initial$tag),
+    selected = unique(gps_index_initial$tag)[1]
   )
-  
+
   selected_table <- reactiveVal(NULL)
-  
+
   day_subset <- reactive({
     req(input$day)
-    gps_index[tag == input$day]
+    gps_index_rv()[tag == input$day]
   })
   
   output$track_table <- renderDT({
-    df <- day_subset()
+    df <- copy(day_subset())
     if (nrow(df) == 0) return(NULL)
-    
+
+    setorder(df, start_time)
     df[, index := .I - 1]
     df[, `Fahrtzeit UTC` := paste(format(start_time, "%H:%M"), "–", format(end_time, "%H:%M"))]
     df[, `GPS [km]` := sprintf("%.1f", travel_distance_m / 1000)]
     df[, `OSRM [km]` := sprintf("%.1f", osrm_distance_m / 1000)]
     df[, `OSRM-Zeit` := osrm_duration_hm]
     df[, `Ist-Zeit` := real_duration_hm]
-    
-    if (nrow(poi_lookup) > 0) {
-      df <- merge(df, poi_lookup, by.x = "poi_start_id", by.y = "id", all.x = TRUE)
-      setnames(df, "name", "StartOrt")
-      df <- merge(df, poi_lookup, by.x = "poi_end_id", by.y = "id", all.x = TRUE)
-      setnames(df, "name", "ZielOrt")
-    }
-    
-    setorder(df, start_time)
-    
-    if (!"StartOrt" %in% names(df)) df[, StartOrt := NA_character_]
-    if (!"ZielOrt" %in% names(df)) df[, ZielOrt := NA_character_]
-    df[is.na(StartOrt), StartOrt := "(unbekannt)"]
-    df[is.na(ZielOrt), ZielOrt := "(unbekannt)"]
-    
+
+    start_dropdowns <- vapply(seq_len(nrow(df)), function(i) {
+      create_poi_dropdown(
+        track_id = df$id[i],
+        field = "start",
+        selected_id = df$poi_start_id[i],
+        coord_entry = df$start_coord[[i]],
+        poi_dt = poi_table
+      )
+    }, character(1))
+
+    end_dropdowns <- vapply(seq_len(nrow(df)), function(i) {
+      create_poi_dropdown(
+        track_id = df$id[i],
+        field = "end",
+        selected_id = df$poi_end_id[i],
+        coord_entry = df$end_coord[[i]],
+        poi_dt = poi_table
+      )
+    }, character(1))
+
+    df[, StartOrt := start_dropdowns]
+    df[, ZielOrt := end_dropdowns]
+
     df[, `Anzeigen` := sprintf('<input type="checkbox" id="anzeigen_%d">', index)]
     df[, `OSRM-Route` := sprintf('<input type="checkbox" id="osrm_%d">', index)]
-    
+
     df <- df[, .(`Anzeigen`, `Fahrtzeit UTC`, StartOrt, ZielOrt, `GPS [km]`, `OSRM [km]`, `OSRM-Zeit`, `Ist-Zeit`, `OSRM-Route`)]
     
     datatable(
@@ -200,13 +313,28 @@ server <- function(input, output, session) {
       callback = JS(
         "table.on('change', 'input', function() {
 var data = {};
-table.rows().every(function(rowIdx, tableLoop, rowLoop) {
-var row = this.node();
-var anzeigen = $(row).find('input[id^=\"anzeigen_\"]').prop('checked');
-var osrm = $(row).find('input[id^=\"osrm_\"]').prop('checked');
-data[rowIdx] = { anzeigen: anzeigen, osrm: osrm };
+table.rows().every(function(rowIdx) {
+  var row = this.node();
+  var anzeigen = $(row).find('input[id^=\"anzeigen_\"]').prop('checked');
+  var osrm = $(row).find('input[id^=\"osrm_\"]').prop('checked');
+  data[rowIdx] = { anzeigen: anzeigen, osrm: osrm };
 });
 Shiny.setInputValue('checkbox_data', data);
+});
+
+table.on('change', 'select.poi-select', function() {
+  var select = $(this);
+  var trackId = parseInt(select.data('track-id'), 10);
+  var field = select.data('field');
+  var value = select.val();
+  if (isNaN(trackId)) {
+    return;
+  }
+  Shiny.setInputValue('poi_update', {
+    track_id: trackId,
+    field: field,
+    value: value || ''
+  }, {priority: 'event'});
 });"
       )
     ) %>%
@@ -216,11 +344,11 @@ Shiny.setInputValue('checkbox_data', data);
   observeEvent(input$apply_selection, {
     raw <- input$checkbox_data
     if (is.null(raw)) return()
-    
+
     df <- day_subset()
     anzeigen_flags <- rep(FALSE, nrow(df))
     osrm_flags <- rep(FALSE, nrow(df))
-    
+
     for (i in seq_len(nrow(df))) {
       entry <- raw[[as.character(i - 1)]]
       if (!is.null(entry)) {
@@ -228,12 +356,63 @@ Shiny.setInputValue('checkbox_data', data);
         osrm_flags[i]     <- isTRUE(entry$osrm)
       }
     }
-    
+
     selected_table(data.table(
       id = df$id,
       anzeigen = anzeigen_flags,
       osrm = osrm_flags
     ))
+  })
+
+  observeEvent(input$poi_update, {
+    update <- input$poi_update
+    req(update$track_id, update$field)
+
+    track_id <- as.integer(update$track_id)
+    if (is.na(track_id)) return()
+
+    field_name <- if (identical(update$field, "start")) "poi_start_id" else "poi_end_id"
+    score_name <- if (identical(update$field, "start")) "poi_start_score" else "poi_end_score"
+    coord_col  <- if (identical(update$field, "start")) "start_coord" else "end_coord"
+
+    new_id <- suppressWarnings(as.integer(update$value))
+    if (is.na(new_id)) {
+      new_id <- NA_integer_
+    }
+
+    current_index <- copy(gps_index_rv())
+    if (!track_id %in% current_index$id) return()
+
+    current_index[id == track_id, (field_name) := new_id]
+
+    new_score <- NA_real_
+    if (!is.na(new_id) && nrow(poi_table) > 0) {
+      poi_match <- poi_table[id == new_id]
+      if (nrow(poi_match) > 0) {
+        coord_list <- current_index[id == track_id][[coord_col]]
+        coord_entry <- if (length(coord_list) > 0) coord_list[[1]] else NULL
+        lat_lon <- extract_lat_lon(coord_entry)
+        if (!any(is.na(lat_lon))) {
+          poi_lat <- suppressWarnings(as.numeric(poi_match$lat[1]))
+          poi_lon <- suppressWarnings(as.numeric(poi_match$lon[1]))
+          if (!any(is.na(c(poi_lat, poi_lon)))) {
+            dist_val <- distHaversine(c(poi_lon, poi_lat), c(lat_lon[2], lat_lon[1]))
+            poi_range <- suppressWarnings(as.numeric(poi_match$range[1]))
+            if (!is.na(poi_range) && poi_range > 0) {
+              new_score <- round((1 - dist_val / poi_range) * 100, 1)
+            }
+          }
+        }
+      }
+    }
+
+    if (!is.na(new_score)) {
+      new_score <- max(min(new_score, 100), 0)
+    }
+
+    current_index[id == track_id, (score_name) := new_score]
+    gps_index_rv(current_index)
+    assign("gps_index", current_index, envir = .GlobalEnv)
   })
   
   output$map <- renderLeaflet({
@@ -293,9 +472,10 @@ Shiny.setInputValue('checkbox_data', data);
           all_coords[[length(all_coords) + 1]] <- coords
         }
       }
-      
+
       if (sel$osrm) {
-        route_raw <- gps_index[id == sel$id]$osrm_route_coords[[1]]
+        current_index <- gps_index_rv()
+        route_raw <- current_index[id == sel$id]$osrm_route_coords[[1]]
         coords_dt <- parse_osrm_route(route_raw)
         if (!is.null(coords_dt)) {
           leafletProxy("map") |> addPolylines(
