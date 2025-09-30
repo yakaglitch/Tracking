@@ -73,6 +73,9 @@ ui <- fluidPage(
     ),
     column(width = 6,
            leafletOutput("map", height = 700),
+           div(style = "margin-top: 10px;",
+               checkboxInput("show_poi", "Points of Interest einblenden", TRUE)
+           ),
            tags$div(
              style = "margin-top:10px; text-align:center;",
              tags$div(
@@ -116,13 +119,24 @@ server <- function(input, output, session) {
     poi_table <- get("poi_table", envir = .GlobalEnv)
     if (all(c("id", "name") %in% names(poi_table))) {
       poi_lookup <- poi_table[, .(id, name)]
+      poi_table[, poi_color := "blue"]
+
+      if ("kategorie" %in% names(poi_table)) {
+        kategorie_clean <- tolower(poi_table$kategorie)
+        poi_table[!is.na(kategorie_clean) & kategorie_clean == "dienstlich", poi_color := "red"]
+      }
+
+      if ("typ" %in% names(poi_table)) {
+        typ_clean <- tolower(poi_table$typ)
+        poi_table[!is.na(typ_clean) & typ_clean == "zuhause" & poi_color != "red", poi_color := "green"]
+      }
     } else {
       poi_warning <- "POI-Tabelle ohne 'id'/'name'-Spalten gefunden. Es wird eine leere Tabelle verwendet."
-      poi_table   <- data.table(id = integer(), name = character())
+      poi_table   <- data.table(id = integer(), name = character(), poi_color = character())
     }
   } else {
     poi_warning <- "POI-Tabelle nicht gefunden. Es wird eine leere Tabelle verwendet."
-    poi_table   <- data.table(id = integer(), name = character())
+    poi_table   <- data.table(id = integer(), name = character(), poi_color = character())
   }
 
   if (!is.null(poi_warning)) {
@@ -223,7 +237,30 @@ Shiny.setInputValue('checkbox_data', data);
   output$map <- renderLeaflet({
     leaflet() |> addTiles()
   })
-  
+
+  observeEvent(input$show_poi, {
+    proxy <- leafletProxy("map") |> clearGroup("poi_markers")
+    if (isTRUE(input$show_poi) && nrow(poi_table) > 0 && all(c("lat", "lon") %in% names(poi_table))) {
+      colors <- poi_table$poi_color
+      if (length(colors) == 0L) {
+        colors <- rep("blue", nrow(poi_table))
+      }
+      proxy |> addCircleMarkers(
+        lng = poi_table$lon,
+        lat = poi_table$lat,
+        color = colors,
+        fillColor = colors,
+        radius = 6,
+        stroke = TRUE,
+        weight = 2,
+        fillOpacity = 0.8,
+        opacity = 0.9,
+        label = poi_table$name,
+        group = "poi_markers"
+      )
+    }
+  }, ignoreNULL = FALSE)
+
   observe({
     leafletProxy("map") |> clearShapes()
     selection <- selected_table()
