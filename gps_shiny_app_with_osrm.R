@@ -107,23 +107,30 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   req(exists("gps_index", envir = .GlobalEnv))
   req(exists("gps_data", envir = .GlobalEnv))
-
+  
   gps_index <- get("gps_index", envir = .GlobalEnv)
   gps_data  <- get("gps_data",  envir = .GlobalEnv)
-
+  
   # POI-Lookup vorbereiten
   poi_lookup  <- data.table(id = integer(), name = character())
   poi_warning <- NULL
-
+  
   if (exists("poi_table", envir = .GlobalEnv)) {
     poi_table <- get("poi_table", envir = .GlobalEnv)
     if (all(c("id", "name") %in% names(poi_table))) {
       poi_lookup <- poi_table[, .(id, name)]
-      if ("kategorie" %in% names(poi_table)) {
-        kategorie_clean <- tolower(poi_table$kategorie)
-        poi_table[, poi_color := ifelse(!is.na(kategorie_clean) & kategorie_clean == "dienststelle", "red", "blue")]
-      } else {
-        poi_table[, poi_color := "blue"]
+      poi_table[, poi_color := "blue"]
+      
+      kategorie_col <- names(poi_table)[tolower(names(poi_table)) == "kategorie"]
+      if (length(kategorie_col) > 0) {
+        kategorie_clean <- tolower(trimws(poi_table[[kategorie_col[1]]]))
+        poi_table[!is.na(kategorie_clean) & kategorie_clean == "dienstlich", poi_color := "red"]
+      }
+      
+      typ_col <- names(poi_table)[tolower(names(poi_table)) == "typ"]
+      if (length(typ_col) > 0) {
+        typ_clean <- tolower(trimws(poi_table[[typ_col[1]]]))
+        poi_table[!is.na(typ_clean) & typ_clean == "zuhause" & poi_color != "red", poi_color := "green"]
       }
     } else {
       poi_warning <- "POI-Tabelle ohne 'id'/'name'-Spalten gefunden. Es wird eine leere Tabelle verwendet."
@@ -133,11 +140,11 @@ server <- function(input, output, session) {
     poi_warning <- "POI-Tabelle nicht gefunden. Es wird eine leere Tabelle verwendet."
     poi_table   <- data.table(id = integer(), name = character(), poi_color = character())
   }
-
+  
   if (!is.null(poi_warning)) {
     showNotification(poi_warning, type = "warning")
   }
-
+  
   # Tag-Spalte für Auswahl aufbereiten
   gps_index[, tag := format(start_time, "%Y-%m-%d")]
   updateSelectInput(
@@ -171,9 +178,9 @@ server <- function(input, output, session) {
       df <- merge(df, poi_lookup, by.x = "poi_end_id", by.y = "id", all.x = TRUE)
       setnames(df, "name", "ZielOrt")
     }
-
+    
     setorder(df, start_time)
-
+    
     if (!"StartOrt" %in% names(df)) df[, StartOrt := NA_character_]
     if (!"ZielOrt" %in% names(df)) df[, ZielOrt := NA_character_]
     df[is.na(StartOrt), StartOrt := "(unbekannt)"]
@@ -232,7 +239,7 @@ Shiny.setInputValue('checkbox_data', data);
   output$map <- renderLeaflet({
     leaflet() |> addTiles()
   })
-
+  
   observeEvent(input$show_poi, {
     proxy <- leafletProxy("map") |> clearGroup("poi_markers")
     if (isTRUE(input$show_poi) && nrow(poi_table) > 0 && all(c("lat", "lon") %in% names(poi_table))) {
@@ -255,7 +262,7 @@ Shiny.setInputValue('checkbox_data', data);
       )
     }
   }, ignoreNULL = FALSE)
-
+  
   observe({
     leafletProxy("map") |> clearShapes()
     selection <- selected_table()
