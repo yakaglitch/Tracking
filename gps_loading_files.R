@@ -9,9 +9,9 @@ convert_nmea_coord <- function(value, hemisphere) {
   if (!nzchar(value)) return(NA_real_)
   value_num <- suppressWarnings(as.numeric(value))
   if (is.na(value_num)) return(NA_real_)
-
+  
   if (nchar(value) <= 4L) return(NA_real_)
-
+  
   if (hemisphere %in% c("N", "S")) {
     deg <- as.integer(substr(value, 1, 2))
     mins <- as.numeric(substr(value, 3, nchar(value)))
@@ -19,9 +19,9 @@ convert_nmea_coord <- function(value, hemisphere) {
     deg <- as.integer(substr(value, 1, 3))
     mins <- as.numeric(substr(value, 4, nchar(value)))
   }
-
+  
   if (is.na(deg) || is.na(mins)) return(NA_real_)
-
+  
   coord <- deg + mins / 60
   if (hemisphere %in% c("S", "W")) coord <- -coord
   coord
@@ -30,41 +30,41 @@ convert_nmea_coord <- function(value, hemisphere) {
 parse_rmc_lines <- function(nmea_lines, tz) {
   gprmc <- grep("^\\$G[NP]RMC", nmea_lines, value = TRUE)
   if (length(gprmc) == 0) return(NULL)
-
+  
   entries <- lapply(seq_along(gprmc), function(idx) {
     parts <- strsplit(gprmc[idx], ",", fixed = TRUE)[[1]]
     if (length(parts) < 10) return(NULL)
     if (parts[3] != "A") return(NULL)
-
+    
     time_str <- parts[2]
     date_str <- parts[10]
-
+    
     if (!nzchar(time_str) || !nzchar(date_str)) return(NULL)
-
+    
     if (nchar(time_str) < 6) return(NULL)
     hour <- suppressWarnings(as.integer(substr(time_str, 1, 2)))
     minute <- suppressWarnings(as.integer(substr(time_str, 3, 4)))
     sec <- suppressWarnings(as.numeric(substr(time_str, 5, nchar(time_str))))
-
+    
     day <- suppressWarnings(as.integer(substr(date_str, 1, 2)))
     month <- suppressWarnings(as.integer(substr(date_str, 3, 4)))
     year <- suppressWarnings(as.integer(substr(date_str, 5, 6)))
-
+    
     if (any(is.na(c(hour, minute, sec, day, month, year)))) return(NULL)
-
+    
     year <- year + ifelse(year < 80, 2000L, 1900L)
     base_time <- as.POSIXct(sprintf("%04d-%02d-%02d %02d:%02d:%02d", year, month, day, hour, minute, floor(sec)), tz = tz)
     if (is.na(base_time)) return(NULL)
     timestamp <- base_time + (sec - floor(sec))
-
+    
     lat <- convert_nmea_coord(parts[4], parts[5])
     lon <- convert_nmea_coord(parts[6], parts[7])
-
+    
     if (is.na(lat) || is.na(lon)) return(NULL)
-
+    
     speed_knots <- suppressWarnings(as.numeric(parts[8]))
     speed_kmh <- if (!is.na(speed_knots)) speed_knots * 1.852 else NA_real_
-
+    
     data.table(
       timestamp = timestamp,
       lat = lat,
@@ -74,120 +74,119 @@ parse_rmc_lines <- function(nmea_lines, tz) {
       source_index = idx
     )
   })
-
+  
   coords <- rbindlist(entries, fill = TRUE)
   if (nrow(coords) == 0) return(NULL)
   setorder(coords, timestamp, source_index)
   coords[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+  coords[, timestamp_ms := format(timestamp, "%Y-%m-%d %H:%M:%OS3", tz = tz)]
+  setcolorder(coords, c("timestamp", "timestamp_ms", "lat", "lon", "speed_knots", "speed_kmh", "source_index", "time_offset_s"))
   coords
 }
 
 downsample_track <- function(track_dt, target_hz) {
-  if (is.null(track_dt) || nrow(track_dt) == 0) return(track_dt)
-  if (!is.finite(target_hz) || target_hz <= 0) return(track_dt)
-
+  if (is.null(track_dt) || nrow(track_dt) == 0) return(copy(track_dt))
+  if (!is.finite(target_hz) || target_hz <= 0) return(copy(track_dt))
+  
   secs <- as.numeric(track_dt$timestamp)
-  if (anyNA(secs)) return(track_dt)
-
+  if (anyNA(secs)) return(copy(track_dt))
+  
+  diffs <- diff(secs)
+  diffs <- diffs[diffs > 0]
+  if (length(diffs) == 0) {
+    result <- copy(track_dt[1])
+    result[, time_offset_s := 0]
+    if (!"timestamp_ms" %in% names(result)) {
+      tz <- attr(track_dt$timestamp, "tzone")
+      if (is.null(tz)) tz <- ""
+      result[, timestamp_ms := format(timestamp, "%Y-%m-%d %H:%M:%OS3", tz = tz)]
+    }
+    return(result)
+  }
+  
+  actual_hz <- 1 / median(diffs)
+  if (!is.finite(actual_hz) || actual_hz <= target_hz + 1e-9) {
+    result <- copy(track_dt)
+    result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+    if (!"timestamp_ms" %in% names(result)) {
+      tz <- attr(track_dt$timestamp, "tzone")
+      if (is.null(tz)) tz <- ""
+      result[, timestamp_ms := format(timestamp, "%Y-%m-%d %H:%M:%OS3", tz = tz)]
+    }
+    return(result)
+  }
+  
   origin <- secs[1]
   bins <- floor((secs - origin) * target_hz + 1e-9)
   keep <- !duplicated(bins)
+  
+  if (all(keep)) {
+    result <- copy(track_dt)
+    result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+    return(result)
+  }
+  
   reduced <- track_dt[keep]
-  reduced[, time_offset_s := as.numeric(timestamp - timestamp[1])]
-  reduced
+  result <- copy(reduced)
+  result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+  if (!"timestamp_ms" %in% names(result)) {
+    tz <- attr(track_dt$timestamp, "tzone")
+    if (is.null(tz)) tz <- ""
+    result[, timestamp_ms := format(timestamp, "%Y-%m-%d %H:%M:%OS3", tz = tz)]
+  }
+  result
 }
 
 prompt_target_frequency <- function(default_hz = 1) {
   freq_values <- c("1 Hz" = 1, "5 Hz" = 5, "10 Hz" = 10)
-  default_label <- names(freq_values)[match(default_hz, freq_values)]
-
+  
   if (!interactive()) {
     message("ℹ️ Skript läuft nicht interaktiv – es wird standardmäßig ", default_hz, " Hz verwendet.")
     return(default_hz)
   }
-
-  if (rstudioapi::isAvailable()) {
-    if (rstudioapi::hasFun("showPrompt")) {
-      numeric_options <- setNames(unname(freq_values), sub(" Hz$", "", names(freq_values)))
-      repeat {
-        selection <- rstudioapi::showPrompt(
-          title = "Maximale Ziel-Abtastrate",
-          message = paste(
-            "Bitte gewünschte maximale Ziel-Abtastrate auswählen (1, 5 oder 10 Hz).",
-            "Der Standardwert 1 Hz ist bereits vorbelegt."
-          ),
-          default = as.character(default_hz)
-        )
-
-        if (is.null(selection)) {
-          message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
-          return(default_hz)
-        }
-
-        selection <- trimws(selection)
-        selection_clean <- gsub("[^0-9]", "", selection)
-        if (selection_clean %in% names(numeric_options)) {
-          chosen <- numeric_options[[selection_clean]]
-          message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen, " Hz.")
-          return(chosen)
-        }
-
-        if (rstudioapi::hasFun("showDialog")) {
-          rstudioapi::showDialog(
-            title = "Ungültige Eingabe",
-            message = "Bitte geben Sie 1, 5 oder 10 ein."
-          )
-        } else {
-          message("⚠️ Ungültige Eingabe. Bitte 1, 5 oder 10 eingeben.")
-        }
-      }
-    }
-
-    if (rstudioapi::hasFun("selectList")) {
-      selection <- rstudioapi::selectList(
+  
+  default_label <- names(freq_values)[match(default_hz, freq_values)]
+  
+  selection <- NULL
+  
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    selection <- tryCatch({
+      selector <- getExportedValue("rstudioapi", "selectList")
+      selector(
         choices = names(freq_values),
         title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
         selected = default_label,
         multiple = FALSE
       )
-
-      if (length(selection) == 0) {
-        message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
-        return(default_hz)
-      }
-
-      chosen <- freq_values[[selection]]
-      message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen, " Hz.")
-      return(chosen)
-    }
+    }, error = function(err) {
+      message("⚠️ RStudio-Auswahldialog nicht verfügbar: ", conditionMessage(err))
+      NULL
+    })
   }
-
-  old_menu_opt <- getOption("menu.graphics")
-  on.exit(options(menu.graphics = old_menu_opt), add = TRUE)
-  options(menu.graphics = FALSE)
-
-  repeat {
-    selection <- utils::menu(
-      choices = names(freq_values),
-      title = paste0(
-        "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung\n",
-        "(0 oder ESC für Abbruch – dann wird der Standardwert ", default_hz, " Hz genutzt)"
-      )
-    )
-
-    if (selection <= 0) {
-      message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
-      return(default_hz)
-    }
-
-    chosen_hz <- unname(freq_values[selection])
-    if (is.finite(chosen_hz) && chosen_hz > 0) {
-      message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen_hz, " Hz.")
-      return(chosen_hz)
-    }
-
-    message("⚠️ Ungültige Auswahl. Bitte erneut versuchen.")
+  
+  if (length(selection) > 0) {
+    chosen <- freq_values[[selection]]
+    message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen, " Hz.")
+    return(chosen)
   }
+  
+  # Fallback auf eine Konsolen- oder Grafik-Auswahl
+  selection <- utils::select.list(
+    choices = names(freq_values),
+    title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
+    preselect = default_label,
+    multiple = FALSE,
+    graphics = TRUE
+  )
+  
+  if (length(selection) == 0) {
+    message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
+    return(default_hz)
+  }
+  
+  chosen <- freq_values[[selection]]
+  message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen, " Hz.")
+  chosen
 }
 
 # Sicherstellen, dass rstudioapi verfügbar ist
@@ -198,9 +197,6 @@ if (!requireNamespace("rstudioapi", quietly = TRUE) || !rstudioapi::isAvailable(
 # ---- 1. Verzeichnisauswahl ----
 root <- rstudioapi::selectDirectory("Wähle Verzeichnis mit YYYY-MM Unterordnern oder direkt einen YYYY-MM-Ordner")
 if (is.null(root)) stop("Abbruch: Kein Ordner gewählt.")
-
-# ---- 1a. Maximale Ziel-Frequenz wählen ----
-target_hz <- prompt_target_frequency(default_hz = 1)
 
 # ---- 2. Regex für Ordner und Dateien ----
 tz_local <- Sys.timezone()
@@ -287,6 +283,7 @@ message("✅ Fertig. ", length(gps_data), " Dateien geladen aus ", length(ym_dir
 empty_template <- data.table(
   track_id = integer(),
   timestamp = as.POSIXct(character(), tz = tz_local),
+  timestamp_ms = character(),
   lat = numeric(),
   lon = numeric(),
   speed_knots = numeric(),
@@ -295,40 +292,59 @@ empty_template <- data.table(
   time_offset_s = numeric()
 )
 
+column_order <- names(empty_template)
+
 parsed_list <- vector("list", length(gps_data))
-resampled_list <- vector("list", length(gps_data))
 
 for (idx in seq_along(gps_data)) {
   key <- names(gps_data)[idx]
   lines <- gps_data[[idx]]
   parsed <- parse_rmc_lines(lines, tz_local)
-
+  
   if (!is.null(parsed) && nrow(parsed) > 0) {
-    parsed_with_id <- copy(parsed)
-    parsed_with_id[, track_id := as.integer(gsub("^track_", "", key))]
-    parsed_list[[idx]] <- parsed_with_id
-
-    reduced <- downsample_track(parsed_with_id, target_hz)
-    if (!is.null(reduced) && nrow(reduced) > 0) {
-      resampled_list[[idx]] <- reduced
-    } else {
-      resampled_list[[idx]] <- empty_template
-    }
+    parsed[, track_id := as.integer(gsub("^track_", "", key))]
+    parsed_list[[idx]] <- parsed
   } else {
-    parsed_list[[idx]] <- empty_template
-    resampled_list[[idx]] <- empty_template
+    parsed_list[[idx]] <- copy(empty_template)
   }
 }
 
 gps_points_raw <- rbindlist(parsed_list, fill = TRUE)
-gps_points_resampled <- rbindlist(resampled_list, fill = TRUE)
+
+if (nrow(gps_points_raw) > 0L) {
+  missing_cols <- setdiff(column_order, names(gps_points_raw))
+  for (col in missing_cols) set(gps_points_raw, j = col, value = NA)
+  setcolorder(gps_points_raw, column_order)
+}
 
 assign("gps_points_raw", gps_points_raw, envir = .GlobalEnv)
+target_hz <- prompt_target_frequency(default_hz = 1)
+
+resampled_list <- lapply(parsed_list, function(track_dt) {
+  if (is.null(track_dt) || nrow(track_dt) == 0) {
+    return(copy(empty_template))
+  }
+  reduced <- downsample_track(track_dt, target_hz)
+  if (is.null(reduced) || nrow(reduced) == 0) {
+    return(copy(empty_template))
+  }
+  reduced
+})
+
+gps_points_resampled <- rbindlist(resampled_list, fill = TRUE)
+
+if (nrow(gps_points_resampled) > 0L) {
+  missing_cols <- setdiff(column_order, names(gps_points_resampled))
+  for (col in missing_cols) set(gps_points_resampled, j = col, value = NA)
+  setcolorder(gps_points_resampled, column_order)
+}
+
 assign("gps_points_resampled", gps_points_resampled, envir = .GlobalEnv)
 assign("gps_resample_hz", target_hz, envir = .GlobalEnv)
 
 message(
   "✅ Reduzierter Datensatz mit ", target_hz, " Hz erstellt (",
   nrow(gps_points_resampled), " Punkte).",
-  " Vollständige Punkte befinden sich in 'gps_points_raw'."
+  " Vollständige Punkte befinden sich in 'gps_points_raw'.",
+  " Zusätzliche Zeitstempel mit Millisekunden sind in 'timestamp_ms' verfügbar."
 )
