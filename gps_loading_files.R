@@ -103,34 +103,49 @@ downsample_track <- function(track_dt, target_hz) {
 }
 
 prompt_target_frequency <- function(default_hz = 1) {
-  allowed_hz <- c(1, 5, 10)
+  freq_values <- c("1 Hz" = 1, "5 Hz" = 5, "10 Hz" = 10)
 
   if (!interactive()) {
     message("ℹ️ Skript läuft nicht interaktiv – es wird standardmäßig ", default_hz, " Hz verwendet.")
     return(default_hz)
   }
 
-  prompt_text <- paste0(
-    "Wähle die maximale Ziel-Abtastrate (nur 1, 5 oder 10 Hz). ",
-    "Drücke Enter für den Standardwert ", default_hz, " Hz: "
-  )
+  default_label <- names(freq_values)[match(default_hz, freq_values)]
 
-  repeat {
-    user_input <- readline(prompt_text)
+  if (!is.na(default_label) && rstudioapi::hasFun("selectList")) {
+    selection <- rstudioapi::selectList(
+      choices = names(freq_values),
+      title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
+      selected = default_label,
+      multiple = FALSE
+    )
 
-    if (!nzchar(user_input)) {
-      message("ℹ️ Keine Eingabe – es wird standardmäßig ", default_hz, " Hz verwendet.")
+    if (length(selection) == 0) {
+      message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
       return(default_hz)
     }
 
-    numeric_value <- suppressWarnings(as.numeric(user_input))
-    if (!is.na(numeric_value) && numeric_value %in% allowed_hz) {
-      message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", numeric_value, " Hz.")
-      return(numeric_value)
-    }
-
-    message("⚠️ Ungültige Eingabe. Erlaubt sind ausschließlich 1, 5 oder 10 Hz.")
+    chosen <- freq_values[[selection]]
+    message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen, " Hz.")
+    return(chosen)
   }
+
+  # Fallback auf eine Konsolen-Auswahl, falls kein selectList verfügbar ist
+  selection <- utils::select.list(
+    choices = names(freq_values),
+    title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
+    preselect = default_label,
+    multiple = FALSE
+  )
+
+  if (length(selection) == 0) {
+    message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
+    return(default_hz)
+  }
+
+  chosen <- freq_values[[selection]]
+  message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen, " Hz.")
+  chosen
 }
 
 # Sicherstellen, dass rstudioapi verfügbar ist
