@@ -108,6 +108,11 @@ downsample_track <- function(track_dt, target_hz) {
   if (!is.finite(actual_hz) || actual_hz <= target_hz + 1e-9) {
     result <- copy(track_dt)
     result[, time_offset_s := as.numeric(timestamp - timestamp[1])]
+    if (!"timestamp_ms" %in% names(result)) {
+      tz <- attr(track_dt$timestamp, "tzone")
+      if (is.null(tz)) tz <- ""
+      result[, timestamp_ms := format(timestamp, "%Y-%m-%d %H:%M:%OS3", tz = tz)]
+    }
     return(result)
   }
 
@@ -142,30 +147,36 @@ prompt_target_frequency <- function(default_hz = 1) {
 
   default_label <- names(freq_values)[match(default_hz, freq_values)]
 
-  if (!is.na(default_label) && rstudioapi::hasFun("selectList")) {
-    selection <- rstudioapi::selectList(
-      choices = names(freq_values),
-      title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
-      selected = default_label,
-      multiple = FALSE
-    )
+  selection <- NULL
 
-    if (length(selection) == 0) {
-      message("ℹ️ Keine Auswahl getroffen – es wird standardmäßig ", default_hz, " Hz verwendet.")
-      return(default_hz)
-    }
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    selection <- tryCatch({
+      selector <- getExportedValue("rstudioapi", "selectList")
+      selector(
+        choices = names(freq_values),
+        title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
+        selected = default_label,
+        multiple = FALSE
+      )
+    }, error = function(err) {
+      message("⚠️ RStudio-Auswahldialog nicht verfügbar: ", conditionMessage(err))
+      NULL
+    })
+  }
 
+  if (length(selection) > 0) {
     chosen <- freq_values[[selection]]
     message("ℹ️ Gewählte maximale Ziel-Abtastrate: ", chosen, " Hz.")
     return(chosen)
   }
 
-  # Fallback auf eine Konsolen-Auswahl, falls kein selectList verfügbar ist
+  # Fallback auf eine Konsolen- oder Grafik-Auswahl
   selection <- utils::select.list(
     choices = names(freq_values),
     title = "Wähle die maximale Ziel-Abtastrate für die Weiterverarbeitung",
     preselect = default_label,
-    multiple = FALSE
+    multiple = FALSE,
+    graphics = TRUE
   )
 
   if (length(selection) == 0) {
@@ -186,9 +197,6 @@ if (!requireNamespace("rstudioapi", quietly = TRUE) || !rstudioapi::isAvailable(
 # ---- 1. Verzeichnisauswahl ----
 root <- rstudioapi::selectDirectory("Wähle Verzeichnis mit YYYY-MM Unterordnern oder direkt einen YYYY-MM-Ordner")
 if (is.null(root)) stop("Abbruch: Kein Ordner gewählt.")
-
-# ---- 1a. Maximale Ziel-Frequenz wählen ----
-target_hz <- prompt_target_frequency(default_hz = 1)
 
 # ---- 2. Regex für Ordner und Dateien ----
 tz_local <- Sys.timezone()
@@ -287,7 +295,6 @@ empty_template <- data.table(
 column_order <- names(empty_template)
 
 parsed_list <- vector("list", length(gps_data))
-resampled_list <- vector("list", length(gps_data))
 
 for (idx in seq_along(gps_data)) {
   key <- names(gps_data)[idx]
@@ -297,21 +304,12 @@ for (idx in seq_along(gps_data)) {
   if (!is.null(parsed) && nrow(parsed) > 0) {
     parsed[, track_id := as.integer(gsub("^track_", "", key))]
     parsed_list[[idx]] <- parsed
-
-    reduced <- downsample_track(parsed, target_hz)
-    if (!is.null(reduced) && nrow(reduced) > 0) {
-      resampled_list[[idx]] <- reduced
-    } else {
-      resampled_list[[idx]] <- empty_template
-    }
   } else {
-    parsed_list[[idx]] <- empty_template
-    resampled_list[[idx]] <- empty_template
+    parsed_list[[idx]] <- copy(empty_template)
   }
 }
 
 gps_points_raw <- rbindlist(parsed_list, fill = TRUE)
-gps_points_resampled <- rbindlist(resampled_list, fill = TRUE)
 
 if (nrow(gps_points_raw) > 0L) {
   missing_cols <- setdiff(column_order, names(gps_points_raw))
@@ -319,13 +317,28 @@ if (nrow(gps_points_raw) > 0L) {
   setcolorder(gps_points_raw, column_order)
 }
 
+assign("gps_points_raw", gps_points_raw, envir = .GlobalEnv)
+target_hz <- prompt_target_frequency(default_hz = 1)
+
+resampled_list <- lapply(parsed_list, function(track_dt) {
+  if (is.null(track_dt) || nrow(track_dt) == 0) {
+    return(copy(empty_template))
+  }
+  reduced <- downsample_track(track_dt, target_hz)
+  if (is.null(reduced) || nrow(reduced) == 0) {
+    return(copy(empty_template))
+  }
+  reduced
+})
+
+gps_points_resampled <- rbindlist(resampled_list, fill = TRUE)
+
 if (nrow(gps_points_resampled) > 0L) {
   missing_cols <- setdiff(column_order, names(gps_points_resampled))
   for (col in missing_cols) set(gps_points_resampled, j = col, value = NA)
   setcolorder(gps_points_resampled, column_order)
 }
 
-assign("gps_points_raw", gps_points_raw, envir = .GlobalEnv)
 assign("gps_points_resampled", gps_points_resampled, envir = .GlobalEnv)
 assign("gps_resample_hz", target_hz, envir = .GlobalEnv)
 
